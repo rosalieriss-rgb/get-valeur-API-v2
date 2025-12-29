@@ -23,6 +23,16 @@ type AnalyzeRequest = {
 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // --- CORS (allow browser + extension calls) ---
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
+
+  // Handle preflight request
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   try {
     // Basic config check
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -51,8 +61,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // Bags-only coarse filter (Phase 1)
     const bagSignals = [
-      "bag", "handbag", "tote", "flap", "hobo", "satchel", "shoulder bag",
-      "kelly", "birkin", "chanel", "hermes", "hermès", "louis vuitton", "lv", "dior"
+      "bag",
+      "handbag",
+      "tote",
+      "flap",
+      "hobo",
+      "satchel",
+      "shoulder bag",
+      "kelly",
+      "birkin",
+      "chanel",
+      "hermes",
+      "hermès",
+      "louis vuitton",
+      "lv",
+      "dior"
     ];
     const text = `${body.title} ${body.categoryHint || ""} ${body.brand || ""}`.toLowerCase();
     const looksLikeBag = bagSignals.some((s) => text.includes(s));
@@ -102,8 +125,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .eq("key", cacheKey)
       .maybeSingle();
 
-    const cacheValid =
-      cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
+    const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
     // Decrement credits helper
     async function decrementCreditsIfFree() {
@@ -120,7 +142,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const remaining = await decrementCreditsIfFree();
       return res.status(200).json({
         ...(cached.value_json as any),
-        credits: { plan: user.plan, remaining: remaining },
+        credits: { plan: user.plan, remaining },
         cached: true
       });
     }
@@ -195,3 +217,4 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: "Internal error", detail: err?.message || String(err) });
   }
 }
+
