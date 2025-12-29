@@ -104,14 +104,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       user = newUser;
     }
 
-    // 2) Enforce credits
-    if (user.plan === "free" && user.credits_remaining <= 0) {
-      return res.status(402).json({
-        error: "No credits remaining",
-        paywall: true,
-        credits: { plan: user.plan, remaining: 0 }
-      });
-    }
+// 2) Enforce credits (DISABLED FOR TESTING)
+// if (user.plan === "free" && user.credits_remaining <= 0) {
+//   return res.status(402).json({
+//     error: "No credits remaining",
+//     paywall: true,
+//     credits: { plan: user.plan, remaining: 0 }
+//   });
+// }
+
 
     // 3) Cache key (for later: real eBay calls)
     const itemKey = body.itemId || body.url;
