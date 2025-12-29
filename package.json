@@ -2,6 +2,8 @@
   "name": "get-valeur-api",
   "private": true,
   "dependencies": {
-    "@vercel/node": "^3.0.0"
+    "@vercel/node": "^3.0.0",
+    "@supabase/supabase-js": "^2.0.0"
   }
 }
+
