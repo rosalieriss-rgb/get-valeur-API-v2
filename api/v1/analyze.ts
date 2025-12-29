@@ -128,16 +128,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
-    // Decrement credits helper
-    async function decrementCreditsIfFree() {
-      if (user.plan !== "free") return null;
-      const remaining = user.credits_remaining - 1;
-      await supabase
-        .from("users")
-        .update({ credits_remaining: remaining, updated_at: new Date().toISOString() })
-        .eq("id", user.id);
-      return remaining;
-    }
+async function decrementCreditsIfFree() {
+  // Credits disabled for testing
+  return user.credits_remaining;
+}
+
 
     if (cacheValid && cached?.value_json) {
       const remaining = await decrementCreditsIfFree();
