@@ -116,7 +116,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 3) Cache key (for later: real eBay calls)
     const itemKey = body.itemId || body.url;
-    const cacheKey = sha256(`phase1:${body.source}:${itemKey}:${body.title}`);
+    const cacheKey = sha256(
+  `active-comps:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${(body as any)?.cacheBuster || ""}`
+);
 
     const now = new Date();
 
