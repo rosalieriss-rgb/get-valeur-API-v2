@@ -851,43 +851,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-  // 3) Fetch comps (prefer SOLD, fallback to ACTIVE)
+ // 3) Build query
 const query = buildSearchQuery(body);
 const marketplaceId = marketplaceIdFromUrl(body.url);
 const filter = buildBrowseFilter(body);
 
-const useSoldComps = true; // temporary hard switch
-
+// 3A) Try SOLD first
+const SOLD_WINDOW_DAYS = 90;
 let compsAll: any[] = [];
+let compsSource: "sold" | "active" = "sold";
+let windowDays: number | null = SOLD_WINDOW_DAYS;
 
-if (useSoldComps) {
-  try {
-    compsAll = await fetchSoldComps({
-      query,
-      limit: 100,
-      marketplaceId,
-      currency: body.price.currency,
-      daysBack: 90,
-    });
-  } catch (e) {
-    // fallback to ACTIVE if sold fails
-    compsAll = await fetchActiveComps({
-      query,
-      limit: 30,
-      marketplaceId,
-      currency: body.price.currency,
-      filter,
-    });
-  }
-} else {
+try {
+  compsAll = await fetchSoldComps({
+    query,
+    limit: 100,
+    marketplaceId,
+    currency: body.price.currency,
+    daysBack: SOLD_WINDOW_DAYS, // <-- keep daysBack if that's what your function uses
+  });
+} catch (e) {
+  compsAll = [];
+}
+
+// 3B) Fallback to ACTIVE if too few sold
+if (compsAll.length < 12) {
+  compsSource = "active";
+  windowDays = null;
+
   compsAll = await fetchActiveComps({
     query,
-    limit: 30,
+    limit: 100,
     marketplaceId,
     currency: body.price.currency,
     filter,
   });
 }
+
 
     
     // 4) Rank + filter comps
