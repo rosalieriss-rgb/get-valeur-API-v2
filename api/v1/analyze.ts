@@ -55,6 +55,10 @@ type Comp = {
   condition?: string;
   url: string;
   itemId?: string;
+
+  // Debug / ranking
+  qualityScore?: number;
+  qualityWhy?: string[];
 };
 
 let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
@@ -64,9 +68,7 @@ let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
  */
 async function getEbayAppToken(): Promise<string> {
   const now = Date.now();
-  if (tokenCache && tokenCache.expiresAtMs > now + 30_000) {
-    return tokenCache.accessToken;
-  }
+  if (tokenCache && tokenCache.expiresAtMs > now + 30_000) return tokenCache.accessToken;
 
   if (!EBAY_CLIENT_ID || !EBAY_CLIENT_SECRET) {
     throw new Error("Missing EBAY_CLIENT_ID / EBAY_CLIENT_SECRET env vars");
@@ -93,7 +95,6 @@ async function getEbayAppToken(): Promise<string> {
 
   const json = (await res.json()) as { access_token: string; expires_in: number };
   tokenCache = { accessToken: json.access_token, expiresAtMs: now + json.expires_in * 1000 };
-
   return tokenCache.accessToken;
 }
 
@@ -169,6 +170,10 @@ function percentile(nums: number[], p: number): number {
   return arr[lo] + (arr[hi] - arr[lo]) * (idx - lo);
 }
 
+function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
 function looksLikeBag(text: string) {
   const bagSignals = [
     "bag",
@@ -182,7 +187,6 @@ function looksLikeBag(text: string) {
     "kelly",
     "birkin",
     "chanel",
-    "hermes",
     "hermes",
     "louis vuitton",
     "lv",
@@ -240,12 +244,34 @@ function cleanTitleForSearch(title: string): string {
 /**
  * Keep size tokens like 25/30/35/40 (important for B/K + many bags)
  */
-const ALLOWED_SIZES = new Set(["15", "18", "20", "22", "24", "25", "26", "27", "28", "30", "32", "33", "34", "35", "36", "38", "40", "41", "45"]);
+const ALLOWED_SIZES = new Set([
+  "15",
+  "18",
+  "20",
+  "22",
+  "24",
+  "25",
+  "26",
+  "27",
+  "28",
+  "30",
+  "32",
+  "33",
+  "34",
+  "35",
+  "36",
+  "38",
+  "40",
+  "41",
+  "45",
+]);
 
 function extractSizeToken(title: string): string | null {
   const t = normalize(title);
   // matches "Birkin 30", "Kelly 25", "30cm", "30 cm"
-  const m = t.match(/\b(15|18|20|22|24|25|26|27|28|30|32|33|34|35|36|38|40|41|45)\b(?:\s*cm)?\b/);
+  const m = t.match(
+    /\b(15|18|20|22|24|25|26|27|28|30|32|33|34|35|36|38|40|41|45)\b(?:\s*cm)?\b/
+  );
   if (m?.[1] && ALLOWED_SIZES.has(m[1])) return m[1];
   return null;
 }
@@ -270,10 +296,7 @@ const LEATHER_TOKENS = [
 function extractLeatherToken(title: string): string | null {
   const t = normalize(title);
   for (const lt of LEATHER_TOKENS) {
-    if (t.includes(normalize(lt))) {
-      // prefer shorter canonical token
-      return lt.split(" ")[0];
-    }
+    if (t.includes(normalize(lt))) return lt.split(" ")[0];
   }
   return null;
 }
@@ -313,10 +336,13 @@ function tokenizeCore(title: string): string[] {
     "women",
     "womens",
     "designer",
-    "leather", // too generic
-    "palladium", // hardware type often too noisy in search
+    "leather",
+    "palladium",
     "gold",
     "silver",
+    "hardware",
+    "auth",
+    "cert",
   ]);
 
   const rawTokens = t.split(" ").map((x) => x.trim()).filter(Boolean);
@@ -325,9 +351,7 @@ function tokenizeCore(title: string): string[] {
   for (const tok of rawTokens) {
     if (stop.has(tok)) continue;
     if (/^\d+$/.test(tok)) {
-      if (ALLOWED_SIZES.has(tok)) {
-        if (!out.includes(tok)) out.push(tok);
-      }
+      if (ALLOWED_SIZES.has(tok) && !out.includes(tok)) out.push(tok);
       continue;
     }
     if (tok.length < 3) continue;
@@ -347,18 +371,45 @@ function buildNegativeTerms(body: AnalyzeRequest): string[] {
   const isHermes = b.includes("hermes");
   const titleHasBirkin = t.includes("birkin");
   const titleHasKelly = t.includes("kelly");
+  if (!(isHermes && (titleHasBirkin || titleHasKelly))) negatives.push("birkin", "kelly");
 
-  if (!(isHermes && (titleHasBirkin || titleHasKelly))) {
-    negatives.push("birkin", "kelly");
-  }
-
-  // Block "style" replicas unless the title contains them
-  const noisy = ["style", "inspired", "look", "like", "replica"];
+  // Block “style/replica” terms unless already in title
+  const noisy = ["style", "inspired", "look", "like", "replica", "dupe", "faux", "not authentic"];
   for (const n of noisy) {
     if (!t.includes(n)) negatives.push(n);
   }
 
   return negatives;
+}
+
+/**
+ * Light model extraction: good enough for ranking + query tightening.
+ */
+function extractModelHint(body: AnalyzeRequest): string | null {
+  const t = normalize(body.title || "");
+  // very common luxury bag models (extend later)
+  const patterns: Array<{ re: RegExp; model: string }> = [
+    { re: /\bbirkin\b/, model: "birkin" },
+    { re: /\bkelly\b/, model: "kelly" },
+    { re: /\bclassic\s+flap\b/, model: "classic flap" },
+    { re: /\b2\.?55\b/, model: "2.55" },
+    { re: /\bboy\b/, model: "boy" },
+    { re: /\bneverfull\b/, model: "neverfull" },
+    { re: /\bspeedy\b/, model: "speedy" },
+    { re: /\balma\b/, model: "alma" },
+    { re: /\bcapucines\b/, model: "capucines" },
+    { re: /\bpeekaboo\b/, model: "peekaboo" },
+    { re: /\bbaguette\b/, model: "baguette" },
+    { re: /\bsaddle\b/, model: "saddle" },
+    { re: /\bbook\s+tote\b/, model: "book tote" },
+    { re: /\blady\s+dior\b/, model: "lady dior" },
+    { re: /\bcassandre\b/, model: "cassandre" },
+    { re: /\ble\s+5\s+a\s+7\b/, model: "le 5 a 7" },
+    { re: /\bloulou\b/, model: "loulou" },
+    { re: /\bjamie\b/, model: "jamie" },
+  ];
+  for (const p of patterns) if (p.re.test(t)) return p.model;
+  return null;
 }
 
 function buildSearchQuery(body: AnalyzeRequest): string {
@@ -368,6 +419,7 @@ function buildSearchQuery(body: AnalyzeRequest): string {
 
   const size = extractSizeToken(titleClean);
   const leather = extractLeatherToken(titleClean);
+  const modelHint = extractModelHint(body);
 
   // Special: Hermes Birkin/Kelly must include (Birkin|Kelly) + size
   if (isBirkinOrKelly(body)) {
@@ -385,6 +437,12 @@ function buildSearchQuery(body: AnalyzeRequest): string {
 
   // General bags:
   const tokens = tokenizeCore(titleClean).slice(0, 7);
+
+  // Ensure model hint included early
+  if (modelHint) {
+    const mh = normalize(modelHint);
+    if (!tokens.includes(mh)) tokens.unshift(mh);
+  }
 
   // Ensure size token included if present
   if (size && !tokens.includes(size)) tokens.unshift(size);
@@ -410,7 +468,6 @@ function buildBrowseFilter(body: AnalyzeRequest): string {
   parts.push("buyingOptions:{FIXED_PRICE|AUCTION}");
 
   const asking = Number(body.price?.amount || 0);
-  const currency = body.price?.currency || "USD";
 
   // price band:
   // - for expensive items, keep a tighter band (e.g. 0.70–1.35)
@@ -423,12 +480,8 @@ function buildBrowseFilter(body: AnalyzeRequest): string {
     const min = Math.max(1, Math.round(asking * lowMult));
     const max = Math.max(min + 1, Math.round(asking * highMult));
 
-    // Browse filter price format: price:[min..max]
-    // Currency is inferred from marketplace; we keep input currency for later filtering anyway.
     parts.push(`price:[${min}..${max}]`);
   }
-
-  // You can add condition filter later if you want (e.g., NEW, USED), but leave for now.
 
   return parts.join(",");
 }
@@ -438,6 +491,340 @@ function buildBrowseFilter(body: AnalyzeRequest): string {
  */
 function marketplaceIdFromUrl(_url: string): string {
   return "EBAY_US";
+}
+
+/**
+ * ===== COMP QUALITY RANKING (generic) =====
+ * Goal:
+ * - filter obvious junk comps (accessories, straps, inserts, etc.)
+ * - rank remaining comps by match quality to the target listing
+ * - compute stats from ONLY top-quality comps
+ */
+
+const JUNK_PHRASES = [
+  "strap",
+  "shoulder strap",
+  "chain",
+  "charm",
+  "bag charm",
+  "twilly",
+  "scarf",
+  "keychain",
+  "key chain",
+  "key holder",
+  "wallet",
+  "card holder",
+  "cardholder",
+  "coin purse",
+  "pouch",
+  "insert",
+  "organizer",
+  "base shaper",
+  "shaper",
+  "stuffing",
+  "raincoat",
+  "rain coat",
+  "cover",
+  "replacement",
+  "repair",
+  "handle",
+  "hardware",
+  "lock only",
+  "keys only",
+  "certificate only",
+  "auth card",
+  "authenticity card",
+  "receipt only",
+  "box only",
+  "dust bag only",
+  "dustbag only",
+  "for parts",
+  "parts only",
+];
+
+const REPLICA_SIGNALS = [
+  "replica",
+  "super fake",
+  "dupe",
+  "inspired",
+  "style",
+  "look like",
+  "not authentic",
+  "faux",
+  "knockoff",
+  "counterfeit",
+  "copy",
+  "mirror 1:1",
+];
+
+function isObviousJunkCompTitle(title: string): boolean {
+  const t = normalize(title);
+  if (!t) return true;
+  if (REPLICA_SIGNALS.some((s) => t.includes(normalize(s)))) return true;
+
+  // If it explicitly says it's not the full bag/item
+  if (JUNK_PHRASES.some((p) => t.includes(normalize(p)))) return true;
+
+  // "bag" present is helpful, but not required (some listings omit)
+  // we don't auto-reject for missing "bag" because Chanel "Classic Flap" etc.
+  return false;
+}
+
+function normalizeBrand(b: string | undefined): string | null {
+  const t = normalize(b || "");
+  if (!t) return null;
+  // common variants
+  if (t === "louisvuitton") return "louis vuitton";
+  if (t === "saintlaurent") return "saint laurent";
+  if (t === "yvessaintlaurent") return "saint laurent";
+  return t;
+}
+
+function conditionBucket(cond?: string): "new" | "used" | "unknown" {
+  const c = normalize(cond || "");
+  if (!c) return "unknown";
+  if (c.includes("new") || c.includes("brand new") || c.includes("unused")) return "new";
+  if (c.includes("pre-owned") || c.includes("used") || c.includes("very good") || c.includes("good") || c.includes("acceptable"))
+    return "used";
+  return "unknown";
+}
+
+function buildTargetSignals(body: AnalyzeRequest) {
+  const titleClean = cleanTitleForSearch(body.title || "");
+  const tNorm = normalize(titleClean);
+
+  const brand = normalizeBrand(body.brand) || "";
+  const size = extractSizeToken(titleClean);
+  const leather = extractLeatherToken(titleClean);
+  const modelHint = extractModelHint(body);
+
+  // Core tokens: derived from title (minus noise)
+  const coreTokens = tokenizeCore(titleClean);
+
+  // Make sure we include model words if present (e.g. "classic flap" => classic, flap)
+  const modelTokens =
+    modelHint?.split(" ").map(normalize).filter(Boolean) || [];
+
+  // Brand tokens (split) — helps when body.brand missing or comp title includes brand
+  const brandTokens =
+    brand ? brand.split(" ").map((x) => x.trim()).filter(Boolean) : [];
+
+  const negatives = buildNegativeTerms(body);
+
+  return {
+    titleNorm: tNorm,
+    brand,
+    size,
+    leather,
+    modelHint: modelHint ? normalize(modelHint) : null,
+    coreTokens,
+    modelTokens,
+    brandTokens,
+    negatives,
+    asking: Number(body.price?.amount || 0),
+    askingCurrency: body.price?.currency || "USD",
+    targetCond: conditionBucket(body.condition),
+  };
+}
+
+function tokenOverlapScore(targetTokens: string[], compTitleNorm: string) {
+  if (!targetTokens.length) return { hits: 0, total: 0, score: 0 };
+  let hits = 0;
+  for (const tok of targetTokens) {
+    const n = normalize(tok);
+    if (!n) continue;
+    // token must appear as a whole word boundary-ish
+    const re = new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    if (re.test(compTitleNorm)) hits += 1;
+  }
+  const total = targetTokens.length;
+  const ratio = total ? hits / total : 0;
+  // non-linear: early hits matter more
+  const score = Math.round(45 * Math.pow(ratio, 0.7));
+  return { hits, total, score };
+}
+
+function priceClosenessScore(asking: number, compPrice: number) {
+  if (!Number.isFinite(asking) || asking <= 0 || !Number.isFinite(compPrice) || compPrice <= 0) return 0;
+  const r = compPrice / asking; // 1 is ideal
+  // Score falls off as you move away; symmetric in log-space
+  const dist = Math.abs(Math.log(r)); // 0 ideal
+  // dist 0 => 25, dist ~0.2 (±22%) => ~18, dist ~0.5 (±65%) => ~9, dist 1 (x2.7) => ~0
+  return Math.round(clamp(25 * (1 - dist / 1.0), 0, 25));
+}
+
+function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
+  const target = buildTargetSignals(body);
+
+  // Currency preference is handled later; ranking ignores currency but we can downweight it
+  const out: Comp[] = [];
+
+  for (const c of compsIn) {
+    const titleNorm = normalize(c.title || "");
+    const why: string[] = [];
+
+    // Hard filters
+    if (!c.url || !titleNorm) continue;
+    if (isObviousJunkCompTitle(c.title)) continue;
+
+    // Price sanity hard filter vs asking (helps remove small accessories that slipped through)
+    const asking = target.asking;
+    const p = Number(c.price?.amount || 0);
+    if (Number.isFinite(asking) && asking > 0 && Number.isFinite(p) && p > 0) {
+      // Too cheap => likely accessory / scammy / wrong item
+      if (asking >= 300 && p < asking * 0.25) continue;
+      // Too expensive => drift to other sizes/materials/rare variants
+      if (asking >= 300 && p > asking * 3.0) continue;
+    }
+
+    let score = 0;
+
+    // Negatives penalty
+    const negHit = target.negatives.find((n) => titleNorm.includes(normalize(n)));
+    if (negHit) {
+      score -= 35;
+      why.push(`neg:${negHit}`);
+    }
+
+    // Brand match
+    if (target.brand) {
+      if (titleNorm.includes(target.brand)) {
+        score += 22;
+        why.push("brand+");
+      } else if (target.brandTokens.length >= 2) {
+        // partial brand token match (e.g. "louis" "vuitton")
+        const { hits } = tokenOverlapScore(target.brandTokens, titleNorm);
+        if (hits >= 1) {
+          score += 12;
+          why.push("brand~");
+        }
+      }
+    }
+
+    // Model hint
+    if (target.modelHint) {
+      if (titleNorm.includes(target.modelHint)) {
+        score += 18;
+        why.push("model+");
+      } else if (target.modelTokens.length) {
+        const { hits } = tokenOverlapScore(target.modelTokens, titleNorm);
+        if (hits >= Math.min(2, target.modelTokens.length)) {
+          score += 10;
+          why.push("model~");
+        }
+      }
+    }
+
+    // Size match
+    if (target.size) {
+      const compSize = extractSizeToken(c.title);
+      if (compSize && compSize === target.size) {
+        score += 20;
+        why.push("size+");
+      } else if (compSize && compSize !== target.size) {
+        score -= 18;
+        why.push(`size!(${compSize})`);
+      } else {
+        // Missing size when target has size => mild penalty
+        score -= 8;
+        why.push("size?");
+      }
+    }
+
+    // Leather match
+    if (target.leather) {
+      const compLeather = extractLeatherToken(c.title);
+      if (compLeather && compLeather === target.leather) {
+        score += 10;
+        why.push("leather+");
+      } else if (compLeather && compLeather !== target.leather) {
+        score -= 6;
+        why.push(`leather!(${compLeather})`);
+      }
+    }
+
+    // Token overlap from cleaned title (generic but strong signal)
+    const overlap = tokenOverlapScore(
+      // prioritize model + core, but cap to avoid overfitting long titles
+      Array.from(new Set([...(target.modelTokens || []), ...(target.coreTokens || [])])).slice(0, 8),
+      titleNorm
+    );
+    score += overlap.score;
+    if (overlap.hits >= 4) why.push("tokens++++");
+    else if (overlap.hits >= 3) why.push("tokens+++");
+    else if (overlap.hits >= 2) why.push("tokens++");
+    else if (overlap.hits >= 1) why.push("tokens+");
+    else why.push("tokens0");
+
+    // Condition similarity (light weight; eBay condition strings are noisy)
+    const tc = target.targetCond;
+    const cc = conditionBucket(c.condition);
+    if (tc !== "unknown" && cc !== "unknown") {
+      if (tc === cc) {
+        score += 6;
+        why.push("cond+");
+      } else {
+        score -= 4;
+        why.push("cond!");
+      }
+    }
+
+    // Currency downweight (preference, not exclusion)
+    if (c.price?.currency && target.askingCurrency && c.price.currency !== target.askingCurrency) {
+      score -= 6;
+      why.push("ccy!");
+    }
+
+    // Price closeness (helps stabilize medians)
+    score += priceClosenessScore(target.asking, p);
+
+    // Clamp final score
+    score = clamp(score, 0, 100);
+
+    // Threshold: keep only plausible comps
+    if (score < 45) continue;
+
+    out.push({ ...c, qualityScore: score, qualityWhy: why });
+  }
+
+  out.sort((a, b) => (b.qualityScore || 0) - (a.qualityScore || 0));
+
+  // Choose “top-quality” comps for stats
+  const topForStats = out.filter((c) => (c.qualityScore || 0) >= 60);
+  const usedForStats = (topForStats.length >= 4 ? topForStats : out).slice(0, 10);
+
+  return {
+    ranked: out,
+    usedForStats,
+    debug: {
+      target: {
+        brand: target.brand || null,
+        modelHint: target.modelHint || null,
+        size: target.size || null,
+        leather: target.leather || null,
+        asking: target.asking,
+        currency: target.askingCurrency,
+        targetCond: target.targetCond,
+      },
+      counts: {
+        input: compsIn.length,
+        kept: out.length,
+        top60: topForStats.length,
+        used: usedForStats.length,
+      },
+    },
+  };
+}
+
+function confidenceFromQuality(usedForStats: Comp[]): "high" | "medium" | "low" {
+  if (usedForStats.length >= 10) {
+    const avg = usedForStats.reduce((s, c) => s + (c.qualityScore || 0), 0) / usedForStats.length;
+    if (avg >= 78) return "high";
+    if (avg >= 68) return "medium";
+    return "low";
+  }
+  if (usedForStats.length >= 7) return "medium";
+  return "low";
 }
 
 /**
@@ -451,7 +838,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
 
     if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed. Use POST." });
+    if (req.method !== "POST")
+      return res.status(405).json({ error: "Method not allowed. Use POST." });
 
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
       return res.status(500).json({ error: "Missing Supabase env vars" });
@@ -501,7 +889,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 2) Cache key
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-      `active-comps:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${(body as any)?.cacheBuster || ""}`
+      `active-comps:v2:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
+        (body as any)?.cacheBuster || ""
+      }`
     );
 
     // Read cache (unless nocache=1)
@@ -513,8 +903,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .eq("key", cacheKey)
         .maybeSingle();
 
-      const cacheValid =
-        cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
+      const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
       if (cacheValid && cached?.value_json) {
         return res.status(200).json({ ...(cached.value_json as any), cached: true });
@@ -528,21 +917,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const compsAll = await fetchActiveComps({
       query,
-      limit: 24,
+      limit: 30, // slightly more input to survive filtering
       marketplaceId,
       currency: body.price.currency,
       filter,
     });
 
-    // Prefer same currency
-    const compsSameCurrency = compsAll.filter((c) => c.price.currency === body.price.currency);
-    const comps = compsSameCurrency.length >= 4 ? compsSameCurrency : compsAll;
+    // 4) Rank + filter comps (generic quality system)
+    const { ranked, usedForStats, debug } = rankAndFilterComps(body, compsAll);
+
+    // Keep some comps for UI (ranked, with qualityScore)
+    const compsForUI = ranked.slice(0, 12);
 
     // Build payload using comps if enough
     let payload: any;
 
-    if (comps.length >= 4) {
-      const prices = comps
+    if (usedForStats.length >= 4) {
+      const prices = usedForStats
         .map((c) => c.price.amount)
         .filter((n) => Number.isFinite(n) && n > 0);
 
@@ -562,19 +953,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       else score = 48;
 
       const rating =
-        score >= 85 ? "A" :
-        score >= 75 ? "B+" :
-        score >= 65 ? "B" :
-        score >= 55 ? "C+" : "C";
+        score >= 85 ? "A" : score >= 75 ? "B+" : score >= 65 ? "B" : score >= 55 ? "C+" : "C";
+
+      const confidence = confidenceFromQuality(usedForStats);
 
       payload = {
         deal: {
           rating,
           score,
           explanationBullets: [
-            "Estimate based on real eBay comps (active listings).",
+            `Estimate based on top-quality eBay comps (active listings): ${usedForStats.length} used.`,
             `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
-            "Next: swap active comps → SOLD comps when access/data source is available.",
+            "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
           ],
         },
         estimate: {
@@ -583,16 +973,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             low: { amount: Math.round(low), currency: body.price.currency },
             high: { amount: Math.round(high), currency: body.price.currency },
           },
-          confidence: prices.length >= 12 ? "high" : (prices.length >= 7 ? "medium" : "low"),
-          method: "active-comps-median",
+          confidence,
+          method: "active-comps-median-top-quality",
         },
-        comps: comps.slice(0, 12),
+        comps: compsForUI,
         meta: {
           compsType: "active",
           query,
           marketplaceId,
           filter,
           totalCompsFound: compsAll.length,
+          keptAfterFiltering: debug.counts.kept,
+          usedForStats: debug.counts.used,
+          targetSignals: debug.target, // helpful while tuning; remove later if you want
         },
       };
     } else {
@@ -609,19 +1002,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       else score = 54;
 
       const rating =
-        score >= 85 ? "A" :
-        score >= 75 ? "B+" :
-        score >= 65 ? "B" :
-        score >= 55 ? "C+" : "C";
+        score >= 85 ? "A" : score >= 75 ? "B+" : score >= 65 ? "B" : score >= 55 ? "C+" : "C";
 
       payload = {
         deal: {
           rating,
           score,
           explanationBullets: [
-            "Not enough matching comps found via eBay search (active listings).",
+            "Not enough high-quality matching comps found via eBay search (active listings).",
             "Using heuristic estimate based on asking price and basic signals.",
-            "Next: improve model/size parsing for tighter comps.",
+            "Next: keep tuning model/size parsing and comp ranking thresholds.",
           ],
         },
         estimate: {
@@ -633,13 +1023,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           confidence: "low",
           method: "fallback-heuristic",
         },
-        comps: compsAll.slice(0, 12),
+        comps: compsForUI.length ? compsForUI : compsAll.slice(0, 12),
         meta: {
           compsType: "heuristic",
           query,
           marketplaceId,
           filter,
           totalCompsFound: compsAll.length,
+          keptAfterFiltering: debug.counts.kept,
+          usedForStats: debug.counts.used,
+          targetSignals: debug.target,
         },
       };
     }
