@@ -472,7 +472,6 @@ function buildBrowseFilter(body: AnalyzeRequest): string {
   parts.push("buyingOptions:{FIXED_PRICE|AUCTION}");
 
   const asking = Number(body.price?.amount || 0);
-
   if (Number.isFinite(asking) && asking > 0) {
     const isExpensive = asking >= 5000;
     const lowMult = isExpensive ? 0.70 : 0.60;
@@ -492,7 +491,7 @@ function marketplaceIdFromUrl(_url: string): string {
 }
 
 /**
- * ===== COMP QUALITY RANKING (generic) =====
+ * ===== COMP QUALITY RANKING =====
  */
 const JUNK_PHRASES = [
   "strap",
@@ -584,8 +583,6 @@ function conditionBucket(cond?: string): "new" | "used" | "unknown" {
 
 function buildTargetSignals(body: AnalyzeRequest) {
   const titleClean = cleanTitleForSearch(body.title || "");
-  const tNorm = normalize(titleClean);
-
   const brand = normalizeBrand(body.brand) || "";
   const size = extractSizeToken(titleClean);
   const leather = extractLeatherToken(titleClean);
@@ -597,7 +594,6 @@ function buildTargetSignals(body: AnalyzeRequest) {
   const negatives = buildNegativeTerms(body);
 
   return {
-    titleNorm: tNorm,
     brand,
     size,
     leather,
@@ -717,22 +713,12 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
       titleNorm
     );
     score += overlap.score;
-    if (overlap.hits >= 4) why.push("tokens++++");
-    else if (overlap.hits >= 3) why.push("tokens+++");
-    else if (overlap.hits >= 2) why.push("tokens++");
-    else if (overlap.hits >= 1) why.push("tokens+");
-    else why.push("tokens0");
 
     const tc = target.targetCond;
     const cc = conditionBucket(c.condition);
     if (tc !== "unknown" && cc !== "unknown") {
-      if (tc === cc) {
-        score += 6;
-        why.push("cond+");
-      } else {
-        score -= 4;
-        why.push("cond!");
-      }
+      if (tc === cc) score += 6;
+      else score -= 4;
     }
 
     if (c.price?.currency && target.askingCurrency && c.price.currency !== target.askingCurrency) {
@@ -756,23 +742,7 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
   return {
     ranked: out,
     usedForStats,
-    debug: {
-      target: {
-        brand: target.brand || null,
-        modelHint: target.modelHint || null,
-        size: target.size || null,
-        leather: target.leather || null,
-        asking: target.asking,
-        currency: target.askingCurrency,
-        targetCond: target.targetCond,
-      },
-      counts: {
-        input: compsIn.length,
-        kept: out.length,
-        top60: topForStats.length,
-        used: usedForStats.length,
-      },
-    },
+    debug: { counts: { input: compsIn.length, kept: out.length, used: usedForStats.length } },
   };
 }
 
@@ -846,13 +816,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       user = newUser;
     }
 
-    // 2) Cache key  (BUMP VERSION HERE to force fresh responses)
+    // 2) Cache key (bump version to invalidate old cache)
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-  `active-comps:v99:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
-    (body as any)?.cacheBuster || ""
-  }`
-);
+      `active-comps:v100:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
+        (body as any)?.cacheBuster || ""
+      }`
+    );
+
     // Read cache (unless nocache=1)
     const now = new Date();
     if (!noCache) {
@@ -899,9 +870,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const high = percentile(prices, 0.75);
 
       const asking = body.price.amount;
-      const ratio = asking / med; // <1 means good deal
+      const ratio = asking / med;
 
-      // Keep numeric score internally (optional)
       let score = 70;
       if (ratio <= 0.85) score = 88;
       else if (ratio <= 0.95) score = 80;
@@ -909,10 +879,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       else if (ratio <= 1.15) score = 58;
       else score = 48;
 
-      // ✅ NEW LABELS (replaces A/B/C)
       const label = dealLabelFromRatio(ratio);
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
-
       const confidence = confidenceFromQuality(usedForStats);
 
       payload = {
@@ -947,11 +915,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           totalCompsFound: compsAll.length,
           keptAfterFiltering: debug.counts.kept,
           usedForStats: debug.counts.used,
-          targetSignals: debug.target,
         },
       };
     } else {
-      // Limited comps: don't show letters, still return label (default fair price)
+      // Limited comps: still return labels (no A/B/C)
       const asking = body.price.amount;
       const est = asking * 0.93;
       const low = asking * 0.84;
@@ -964,7 +931,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       else if (ratio <= 1.05) score = 62;
       else score = 54;
 
-      const label: DealLabel = "fair_price";
+      const label = dealLabelFromRatio(ratio);
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
 
       payload = {
@@ -977,7 +944,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           explanationBullets: [
             "Not enough high-quality matching comps found in active listings.",
             "Showing a low-confidence estimate based on available signals.",
-            "Tip: try another listing or a clearer model/size title for tighter comps.",
           ],
         },
         estimate: {
@@ -999,7 +965,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           totalCompsFound: compsAll.length,
           keptAfterFiltering: debug.counts.kept,
           usedForStats: debug.counts.used,
-          targetSignals: debug.target,
         },
       };
     }
