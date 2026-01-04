@@ -851,34 +851,35 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // 3) Fetch ACTIVE comps
-    const query = buildSearchQuery(body);
-    const marketplaceId = marketplaceIdFromUrl(body.url);
-    const filter = buildBrowseFilter(body);
+  // 3) Fetch comps (prefer SOLD, fallback to ACTIVE)
+const query = buildSearchQuery(body);
+const marketplaceId = marketplaceIdFromUrl(body.url);
+const filter = buildBrowseFilter(body);
 
-    const compsAll = await fetchActiveComps({
+const useSoldComps = true; // temporary hard switch
+
+let compsAll: any[] = [];
+
+if (useSoldComps) {
+  try {
+    compsAll = await fetchSoldComps({
+      query,
+      limit: 100,
+      marketplaceId,
+      currency: body.price.currency,
+      daysBack: 90,
+    });
+  } catch (e) {
+    // fallback to ACTIVE if sold fails
+    compsAll = await fetchActiveComps({
       query,
       limit: 30,
       marketplaceId,
       currency: body.price.currency,
       filter,
     });
-
-// 3a) Fetch SOLD comps (preferred)
-const useSoldComps = true; // ← temporary hard switch
-
-let compsAll: any[] = [];
-
-if (useSoldComps) {
-  compsAll = await fetchSoldComps({
-    query,
-    limit: 100,
-    marketplaceId,
-    currency: body.price.currency,
-    daysBack: 90,
-  });
+  }
 } else {
-  // 3b) Fetch ACTIVE comps (fallback)
   compsAll = await fetchActiveComps({
     query,
     limit: 30,
