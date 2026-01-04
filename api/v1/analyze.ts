@@ -942,16 +942,27 @@ if (compsAll.length < 12) {
           method: "active-comps-median-top-quality",
         },
         comps: compsForUI,
-        meta: {
-          backendVersion: "deal-labels-v1",
-          compsType: "active",
-          query,
-          marketplaceId,
-          filter,
-          totalCompsFound: compsAll.length,
-          keptAfterFiltering: debug.counts.kept,
-          usedForStats: debug.counts.used,
-        },
+       meta: {
+  backendVersion: "sold-comps-v1",
+
+  // NEW — source of comps
+  compsSource,                  // "sold" | "active"
+  windowDays,                   // 90 for sold, null for active
+
+  // keep compsType for backward compatibility
+  compsType: compsSource === "sold" ? "sold" : "active",
+
+  // existing fields (keep them)
+  query,
+  marketplaceId,
+  filter,
+
+  // rename clarity (optional but recommended)
+  compsFound: compsAll.length,
+  keptAfterFiltering: debug.counts.kept,
+  compsUsed: debug.counts.used,
+},
+
       };
     } else {
       // Limited comps: still return labels (no A/B/C)
