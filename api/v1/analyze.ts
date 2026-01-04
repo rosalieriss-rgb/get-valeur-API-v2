@@ -63,6 +63,27 @@ type Comp = {
 
 let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
 
+type DealLabel = "great_deal" | "fair_price" | "overpriced";
+
+function dealLabelFromRatio(ratio: number): DealLabel {
+  if (!Number.isFinite(ratio) || ratio <= 0) return "fair_price";
+  if (ratio <= 0.88) return "great_deal";
+  if (ratio <= 1.05) return "fair_price";
+  return "overpriced";
+}
+
+function dealLabelMeta(label: DealLabel) {
+  switch (label) {
+    case "great_deal":
+      return { title: "Great deal", emoji: "🟢" };
+    case "fair_price":
+      return { title: "Fair price", emoji: "🟡" };
+    case "overpriced":
+      return { title: "Overpriced", emoji: "🔴" };
+  }
+}
+
+
 /**
  * ===== DEAL LABELS (user-friendly) =====
  */
