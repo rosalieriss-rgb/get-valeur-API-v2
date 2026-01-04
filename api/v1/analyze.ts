@@ -849,11 +849,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 2) Cache key  (BUMP VERSION HERE to force fresh responses)
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-      `active-comps:v99:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
-        (body as any)?.cacheBuster || ""
-      }`
-    );
-
+  `active-comps:v99:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
+    (body as any)?.cacheBuster || ""
+  }`
+);
     // Read cache (unless nocache=1)
     const now = new Date();
     if (!noCache) {
