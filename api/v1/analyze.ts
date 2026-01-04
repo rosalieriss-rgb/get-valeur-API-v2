@@ -159,6 +159,13 @@ function percentile(nums: number[], p: number): number {
   return arr[lo] + (arr[hi] - arr[lo]) * (idx - lo);
 }
 
+function confidenceFromCount(n: number): "high" | "medium" | "low" | "very_low" {
+  if (n >= 20) return "high";
+  if (n >= 12) return "medium";
+  if (n >= 5) return "low";
+  return "very_low";
+}
+
 function looksLikeBag(text: string) {
   const bagSignals = [
     "bag",
@@ -219,27 +226,20 @@ function cleanTitleForSearch(title: string): string {
     "rare",
   ];
 
-  const lowered = t.toLowerCase();
   for (const s of stopPhrases) {
     const re = new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
     t = t.replace(re, " ");
   }
 
-  // collapse spaces again
-  t = t.replace(/\s+/g, " ").trim();
-  return t;
+  return t.replace(/\s+/g, " ").trim();
 }
 
 function buildSearchQuery(body: AnalyzeRequest): string {
   const title = cleanTitleForSearch(body.title || "");
   const brand = (body.brand || "").trim();
 
-  // If title already contains brand, keep title as-is.
   if (brand && title.toLowerCase().includes(brand.toLowerCase())) return title;
-
-  // Otherwise prefix brand for better match.
   if (brand) return `${brand} ${title}`.trim();
-
   return title;
 }
 
@@ -247,8 +247,7 @@ function buildSearchQuery(body: AnalyzeRequest): string {
  * Simple marketplace mapping (keep EBAY_US for now).
  * Later we can map by domain (.fr/.it/.de), but this is fine for v1.
  */
-function marketplaceIdFromUrl(url: string): string {
-  // You can extend later: EBAY_GB, EBAY_DE, EBAY_FR, EBAY_IT...
+function marketplaceIdFromUrl(_url: string): string {
   return "EBAY_US";
 }
 
@@ -256,18 +255,18 @@ function marketplaceIdFromUrl(url: string): string {
  * ===== MAIN HANDLER =====
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Always set CORS early so browser/devtools can read error payloads
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
+
   try {
+    if (req.method === "OPTIONS") return res.status(204).end();
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed. Use POST." });
+
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
       return res.status(500).json({ error: "Missing Supabase env vars" });
     }
-
-    // CORS
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
-
-    if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed. Use POST." });
 
     const noCache = String((req.query as any)?.nocache || "") === "1";
 
@@ -316,8 +315,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       `active-comps:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${(body as any)?.cacheBuster || ""}`
     );
 
-    // Read cache (unless nocache=1)
     const now = new Date();
+
+    // Read cache (unless nocache=1)
     if (!noCache) {
       const { data: cached } = await supabase
         .from("cache")
@@ -329,7 +329,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
       if (cacheValid && cached?.value_json) {
-        return res.status(200).json({ ...(cached.value_json as any), cached: true });
+        const cachedPayload = cached.value_json as any;
+
+        // ensure meta exists + mark usedCache
+        cachedPayload.meta = {
+          ...(cachedPayload.meta || {}),
+          usedCache: true,
+          cacheKey,
+          itemKey,
+        };
+
+        return res.status(200).json({ ...cachedPayload, cached: true });
       }
     }
 
@@ -344,69 +354,142 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       currency: body.price.currency,
     });
 
-    // Filter comps to same currency if possible
+    // Currency filter
     const compsSameCurrency = compsAll.filter((c) => c.price.currency === body.price.currency);
-    const comps = compsSameCurrency.length >= 4 ? compsSameCurrency : compsAll;
+    const useSameCurrency = compsSameCurrency.length >= 5; // stricter than before
+    const comps = useSameCurrency ? compsSameCurrency : compsAll;
 
-    // Build payload using comps if enough
+    const compsUsedCount = comps.length;
+    const compsFoundCount = compsAll.length;
+
+    // Helper: meta base (always returned)
+    const metaBase = {
+      marketplace: "ebay",
+      compsType: "" as "active_listings" | "heuristic",
+      usedCache: false,
+      cacheKey,
+      itemKey,
+      queryUsed: query,
+      marketplaceId,
+      compsFound: compsFoundCount,
+      compsUsed: compsUsedCount,
+      currencyFilter: useSameCurrency ? body.price.currency : "mixed",
+    };
+
+    // 4) If enough comps, compute stats; else fallback heuristic
     let payload: any;
 
-    if (comps.length >= 4) {
+    if (compsUsedCount >= 5) {
       const prices = comps
         .map((c) => c.price.amount)
         .filter((n) => Number.isFinite(n) && n > 0);
 
-      const med = median(prices);
-      const low = percentile(prices, 0.25);
-      const high = percentile(prices, 0.75);
+      // Safety: if somehow prices shrink below 5
+      if (prices.length < 5) {
+        // fall back to heuristic
+        const asking = body.price.amount;
+        const est = asking * 0.93;
+        const low = asking * 0.84;
+        const high = asking * 1.02;
 
-      // Deal score: asking vs median
-      const asking = body.price.amount;
-      const ratio = asking / med; // <1 means good deal
+        const ratio = asking / est;
+        let score = 62;
+        if (ratio <= 0.95) score = 74;
+        else if (ratio <= 1.05) score = 62;
+        else score = 54;
 
-      let score = 70;
-      if (ratio <= 0.85) score = 88;
-      else if (ratio <= 0.95) score = 80;
-      else if (ratio <= 1.05) score = 68;
-      else if (ratio <= 1.15) score = 58;
-      else score = 48;
+        const rating =
+          score >= 85 ? "A" :
+          score >= 75 ? "B+" :
+          score >= 65 ? "B" :
+          score >= 55 ? "C+" : "C";
 
-      const rating =
-        score >= 85 ? "A" :
-        score >= 75 ? "B+" :
-        score >= 65 ? "B" :
-        score >= 55 ? "C+" : "C";
-
-      payload = {
-        deal: {
-          rating,
-          score,
-          explanationBullets: [
-            "Estimate based on real eBay comps (active listings).",
-            `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
-            "Next: swap active comps → SOLD comps when access/data source is available.",
-          ],
-        },
-        estimate: {
-          resaleValue: { amount: Math.round(med), currency: body.price.currency },
-          range: {
-            low: { amount: Math.round(low), currency: body.price.currency },
-            high: { amount: Math.round(high), currency: body.price.currency },
+        payload = {
+          deal: {
+            rating,
+            score,
+            explanationBullets: [
+              "Not enough clean comp prices after filtering.",
+              "Using heuristic estimate based on asking price and basic signals.",
+              "Next: improve comp filtering + better query parsing (model/size).",
+            ],
           },
-          confidence: prices.length >= 12 ? "medium" : "low",
-          method: "active-comps-median",
-        },
-        comps: comps.slice(0, 12),
-        meta: { compsType: "active", query, marketplaceId, totalCompsFound: compsAll.length },
-      };
+          estimate: {
+            resaleValue: { amount: Math.round(est), currency: body.price.currency },
+            range: {
+              low: { amount: Math.round(low), currency: body.price.currency },
+              high: { amount: Math.round(high), currency: body.price.currency },
+            },
+            confidence: "medium",
+            method: "fallback-heuristic",
+          },
+          comps: compsAll.slice(0, 12),
+          meta: {
+            ...metaBase,
+            compsType: "heuristic",
+          },
+        };
+      } else {
+        const med = median(prices);
+        const p25 = percentile(prices, 0.25);
+        const p75 = percentile(prices, 0.75);
+
+        // Deal score: asking vs median
+        const asking = body.price.amount;
+        const ratio = asking / med; // <1 means good deal
+
+        let score = 70;
+        if (ratio <= 0.85) score = 88;
+        else if (ratio <= 0.95) score = 80;
+        else if (ratio <= 1.05) score = 68;
+        else if (ratio <= 1.15) score = 58;
+        else score = 48;
+
+        const rating =
+          score >= 85 ? "A" :
+          score >= 75 ? "B+" :
+          score >= 65 ? "B" :
+          score >= 55 ? "C+" : "C";
+
+        const conf = confidenceFromCount(prices.length);
+
+        payload = {
+          deal: {
+            rating,
+            score,
+            explanationBullets: [
+              "Estimate based on eBay comps (active listings).",
+              `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
+              "Next: swap active comps → SOLD comps when access/data source is available.",
+            ],
+          },
+          estimate: {
+            resaleValue: { amount: Math.round(med), currency: body.price.currency },
+            range: {
+              low: { amount: Math.round(p25), currency: body.price.currency },
+              high: { amount: Math.round(p75), currency: body.price.currency },
+            },
+            confidence: conf === "very_low" ? "low" : conf, // keep UI simple
+            method: "active-comps-median",
+          },
+          comps: comps.slice(0, 12),
+          meta: {
+            ...metaBase,
+            compsType: "active_listings",
+            compMedian: med,
+            compP25: p25,
+            compP75: p75,
+            pricesUsed: prices.length,
+          },
+        };
+      }
     } else {
-      // 4) Fallback heuristic (still sane!)
+      // Fallback heuristic (safer when comps are too few)
       const asking = body.price.amount;
-      const est = asking * 0.93; // slightly under asking for "expected resale" (tunable)
+      const est = asking * 0.93;
       const low = asking * 0.84;
       const high = asking * 1.02;
 
-      // Score heuristic
       const ratio = asking / est;
       let score = 62;
       if (ratio <= 0.95) score = 74;
@@ -424,9 +507,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           rating,
           score,
           explanationBullets: [
-            "Not enough matching comps found via eBay search (active listings).",
+            `Not enough matching comps found (only ${compsUsedCount}).`,
             "Using heuristic estimate based on asking price and basic signals.",
-            "Next: improve search query parsing (model/size) for tighter comps.",
+            "Next: improve query parsing (model/size) for tighter comps.",
           ],
         },
         estimate: {
@@ -439,7 +522,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           method: "fallback-heuristic",
         },
         comps: compsAll.slice(0, 12),
-        meta: { compsType: "heuristic", query, marketplaceId, totalCompsFound: compsAll.length },
+        meta: {
+          ...metaBase,
+          compsType: "heuristic",
+        },
       };
     }
 
@@ -466,6 +552,3 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: "Internal error", detail: err?.message || String(err) });
   }
 }
-
- 
-
