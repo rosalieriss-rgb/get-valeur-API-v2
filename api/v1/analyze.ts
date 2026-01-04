@@ -21,6 +21,16 @@ function sha256(input: string) {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+function normalize(s: string): string {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // remove accents
+    .replace(/[^\w\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
  * ===== TYPES =====
  */
@@ -51,7 +61,6 @@ let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
 
 /**
  * ===== EBAY TOKEN (App token) =====
- * Uses OAuth client_credentials grant.
  */
 async function getEbayAppToken(): Promise<string> {
   const now = Date.now();
@@ -73,7 +82,6 @@ async function getEbayAppToken(): Promise<string> {
     },
     body: new URLSearchParams({
       grant_type: "client_credentials",
-      // Note: this scope string is the standard eBay scope; it works with sandbox/prod base URLs.
       scope: "https://api.ebay.com/oauth/api_scope",
     }).toString(),
   });
@@ -91,21 +99,22 @@ async function getEbayAppToken(): Promise<string> {
 
 /**
  * ===== EBAY BROWSE SEARCH (ACTIVE comps) =====
- * Browse API is active listings; this is our "real comps now" source.
+ * Uses Browse API item_summary/search.
  */
 async function fetchActiveComps(params: {
   query: string;
   limit: number;
   marketplaceId: string; // e.g., EBAY_US
   currency: string;
+  filter: string;
 }): Promise<Comp[]> {
   const token = await getEbayAppToken();
 
-  const q = params.query.trim().slice(0, 140);
+  const q = params.query.trim().slice(0, 200);
   const url = new URL(`${EBAY_BASE}/buy/browse/v1/item_summary/search`);
   url.searchParams.set("q", q);
   url.searchParams.set("limit", String(params.limit));
-  url.searchParams.set("filter", "buyingOptions:{FIXED_PRICE|AUCTION}");
+  url.searchParams.set("filter", params.filter);
 
   const res = await fetch(url.toString(), {
     headers: {
@@ -129,7 +138,7 @@ async function fetchActiveComps(params: {
       if (!Number.isFinite(amount) || amount <= 0) return null;
 
       return {
-        title: String(it?.title || "").slice(0, 160),
+        title: String(it?.title || "").slice(0, 180),
         price: { amount, currency },
         condition: it?.condition,
         url: it?.itemWebUrl || it?.itemHref || "",
@@ -160,37 +169,6 @@ function percentile(nums: number[], p: number): number {
   return arr[lo] + (arr[hi] - arr[lo]) * (idx - lo);
 }
 
-/**
- * ===== ROBUST FILTER HELPERS =====
- * Prevent "median explodes" when search returns unrelated expensive items.
- */
-function normalize(s: string) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function brandAliases(brand?: string): string[] {
-  const b = normalize(brand || "");
-  if (!b) return [];
-
-  // Minimal aliases for now — extend later as needed.
-  if (b.includes("louis vuitton")) return ["louis vuitton", "lv"];
-  if (b.includes("saint laurent")) return ["saint laurent", "ysl"];
-  if (b.includes("hermes") || b.includes("hermès")) return ["hermes", "hermès"];
-  return [b];
-}
-
-function iqrBounds(nums: number[]) {
-  if (nums.length < 8) return { lo: -Infinity, hi: Infinity }; // not enough data
-  const q1 = percentile(nums, 0.25);
-  const q3 = percentile(nums, 0.75);
-  const iqr = q3 - q1;
-  return { lo: q1 - 1.5 * iqr, hi: q3 + 1.5 * iqr };
-}
-
 function looksLikeBag(text: string) {
   const bagSignals = [
     "bag",
@@ -205,7 +183,7 @@ function looksLikeBag(text: string) {
     "birkin",
     "chanel",
     "hermes",
-    "hermès",
+    "hermes",
     "louis vuitton",
     "lv",
     "dior",
@@ -216,13 +194,12 @@ function looksLikeBag(text: string) {
     "ysl",
     "saint laurent",
   ];
-  const t = text.toLowerCase();
-  return bagSignals.some((s) => t.includes(s));
+  const t = normalize(text);
+  return bagSignals.some((s) => t.includes(normalize(s)));
 }
 
 /**
- * ===== QUERY CLEANING (IMPORTANT) =====
- * Reduce noisy titles so eBay search returns tighter comps.
+ * ===== QUERY CLEANING =====
  */
 function cleanTitleForSearch(title: string): string {
   let t = (title || "")
@@ -245,7 +222,6 @@ function cleanTitleForSearch(title: string): string {
     "dustbag",
     "box",
     "tags",
-    "new",
     "brand new",
     "nwt",
     "mint",
@@ -261,24 +237,206 @@ function cleanTitleForSearch(title: string): string {
   return t;
 }
 
+/**
+ * Keep size tokens like 25/30/35/40 (important for B/K + many bags)
+ */
+const ALLOWED_SIZES = new Set(["15", "18", "20", "22", "24", "25", "26", "27", "28", "30", "32", "33", "34", "35", "36", "38", "40", "41", "45"]);
+
+function extractSizeToken(title: string): string | null {
+  const t = normalize(title);
+  // matches "Birkin 30", "Kelly 25", "30cm", "30 cm"
+  const m = t.match(/\b(15|18|20|22|24|25|26|27|28|30|32|33|34|35|36|38|40|41|45)\b(?:\s*cm)?\b/);
+  if (m?.[1] && ALLOWED_SIZES.has(m[1])) return m[1];
+  return null;
+}
+
+const LEATHER_TOKENS = [
+  "epson",
+  "togo",
+  "clemence",
+  "swift",
+  "box",
+  "chevre",
+  "chevre mysore",
+  "chevre mysores",
+  "barenia",
+  "barenia faubourg",
+  "alligator",
+  "crocodile",
+  "ostrich",
+  "lizard",
+];
+
+function extractLeatherToken(title: string): string | null {
+  const t = normalize(title);
+  for (const lt of LEATHER_TOKENS) {
+    if (t.includes(normalize(lt))) {
+      // prefer shorter canonical token
+      return lt.split(" ")[0];
+    }
+  }
+  return null;
+}
+
+function isBirkinOrKelly(body: AnalyzeRequest): boolean {
+  const t = normalize(body.title || "");
+  const b = normalize(body.brand || "");
+  const isHermes = b.includes("hermes");
+  const hasBK = t.includes("birkin") || t.includes("kelly");
+  return isHermes && hasBK;
+}
+
+function tokenizeCore(title: string): string[] {
+  const t = normalize(title);
+
+  const stop = new Set([
+    "bag",
+    "handbag",
+    "purse",
+    "tote",
+    "shoulder",
+    "crossbody",
+    "satchel",
+    "hobo",
+    "authentic",
+    "original",
+    "with",
+    "all",
+    "paperwork",
+    "receipt",
+    "dustbag",
+    "dust",
+    "box",
+    "tags",
+    "rare",
+    "vintage",
+    "women",
+    "womens",
+    "designer",
+    "leather", // too generic
+    "palladium", // hardware type often too noisy in search
+    "gold",
+    "silver",
+  ]);
+
+  const rawTokens = t.split(" ").map((x) => x.trim()).filter(Boolean);
+
+  const out: string[] = [];
+  for (const tok of rawTokens) {
+    if (stop.has(tok)) continue;
+    if (/^\d+$/.test(tok)) {
+      if (ALLOWED_SIZES.has(tok)) {
+        if (!out.includes(tok)) out.push(tok);
+      }
+      continue;
+    }
+    if (tok.length < 3) continue;
+    if (!out.includes(tok)) out.push(tok);
+  }
+
+  return out;
+}
+
+function buildNegativeTerms(body: AnalyzeRequest): string[] {
+  const t = normalize(body.title || "");
+  const b = normalize(body.brand || "");
+
+  const negatives: string[] = [];
+
+  // If item isn't Hermes Birkin/Kelly, block those high-price drift terms
+  const isHermes = b.includes("hermes");
+  const titleHasBirkin = t.includes("birkin");
+  const titleHasKelly = t.includes("kelly");
+
+  if (!(isHermes && (titleHasBirkin || titleHasKelly))) {
+    negatives.push("birkin", "kelly");
+  }
+
+  // Block "style" replicas unless the title contains them
+  const noisy = ["style", "inspired", "look", "like", "replica"];
+  for (const n of noisy) {
+    if (!t.includes(n)) negatives.push(n);
+  }
+
+  return negatives;
+}
+
 function buildSearchQuery(body: AnalyzeRequest): string {
-  const title = cleanTitleForSearch(body.title || "");
+  const titleClean = cleanTitleForSearch(body.title || "");
   const brand = (body.brand || "").trim();
+  const brandPart = brand ? `"${brand}"` : "";
 
-  // If title already contains brand, keep title as-is.
-  if (brand && title.toLowerCase().includes(brand.toLowerCase())) return title;
+  const size = extractSizeToken(titleClean);
+  const leather = extractLeatherToken(titleClean);
 
-  // Otherwise prefix brand for better match.
-  if (brand) return `${brand} ${title}`.trim();
+  // Special: Hermes Birkin/Kelly must include (Birkin|Kelly) + size
+  if (isBirkinOrKelly(body)) {
+    const t = normalize(titleClean);
+    const model = t.includes("birkin") ? "Birkin" : "Kelly";
+    const parts = [
+      brandPart || `"Hermes"`,
+      `"${model}"`,
+      size ? `"${size}"` : "",
+      leather ? `"${leather}"` : "",
+    ].filter(Boolean);
 
-  return title;
+    return parts.join(" ").trim();
+  }
+
+  // General bags:
+  const tokens = tokenizeCore(titleClean).slice(0, 7);
+
+  // Ensure size token included if present
+  if (size && !tokens.includes(size)) tokens.unshift(size);
+
+  // Ensure leather token included if present
+  if (leather && !tokens.includes(leather)) tokens.push(leather);
+
+  const core = tokens.length ? tokens.map((t) => `"${t}"`).join(" ") : `"${titleClean}"`;
+  const negatives = buildNegativeTerms(body);
+  const negativeStr = negatives.map((n) => `-"${n}"`).join(" ");
+
+  return [brandPart, core, negativeStr].filter(Boolean).join(" ").trim();
+}
+
+/**
+ * Browse API filter builder.
+ * Key improvement: add a price band around asking price to avoid drift.
+ */
+function buildBrowseFilter(body: AnalyzeRequest): string {
+  const parts: string[] = [];
+
+  // keep both auctions + fixed
+  parts.push("buyingOptions:{FIXED_PRICE|AUCTION}");
+
+  const asking = Number(body.price?.amount || 0);
+  const currency = body.price?.currency || "USD";
+
+  // price band:
+  // - for expensive items, keep a tighter band (e.g. 0.70–1.35)
+  // - for normal items, slightly wider (0.60–1.50)
+  if (Number.isFinite(asking) && asking > 0) {
+    const isExpensive = asking >= 5000;
+    const lowMult = isExpensive ? 0.70 : 0.60;
+    const highMult = isExpensive ? 1.35 : 1.50;
+
+    const min = Math.max(1, Math.round(asking * lowMult));
+    const max = Math.max(min + 1, Math.round(asking * highMult));
+
+    // Browse filter price format: price:[min..max]
+    // Currency is inferred from marketplace; we keep input currency for later filtering anyway.
+    parts.push(`price:[${min}..${max}]`);
+  }
+
+  // You can add condition filter later if you want (e.g., NEW, USED), but leave for now.
+
+  return parts.join(",");
 }
 
 /**
  * Simple marketplace mapping (keep EBAY_US for now).
- * Later we can map by domain (.fr/.it/.de), but this is fine for v1.
  */
-function marketplaceIdFromUrl(url: string): string {
+function marketplaceIdFromUrl(_url: string): string {
   return "EBAY_US";
 }
 
@@ -287,18 +445,16 @@ function marketplaceIdFromUrl(url: string): string {
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-      return res.status(500).json({ error: "Missing Supabase env vars" });
-    }
-
     // CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
 
     if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed. Use POST." });
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed. Use POST." });
+
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({ error: "Missing Supabase env vars" });
     }
 
     const noCache = String((req.query as any)?.nocache || "") === "1";
@@ -365,59 +521,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // 3) Fetch ACTIVE comps
+    // 3) Fetch ACTIVE comps (tighter query + price band)
     const query = buildSearchQuery(body);
     const marketplaceId = marketplaceIdFromUrl(body.url);
+    const filter = buildBrowseFilter(body);
 
     const compsAll = await fetchActiveComps({
       query,
       limit: 24,
       marketplaceId,
       currency: body.price.currency,
+      filter,
     });
 
-    // Prefer same currency if enough exist
+    // Prefer same currency
     const compsSameCurrency = compsAll.filter((c) => c.price.currency === body.price.currency);
-    const compsBase = compsSameCurrency.length >= 4 ? compsSameCurrency : compsAll;
-
-    // --- Robust comp filtering (prevents crazy medians) ---
-    const asking = body.price.amount;
-    const aliases = brandAliases(body.brand);
-
-    let compsUsed = compsBase;
-
-    // 1) Brand gate (only if brand provided)
-    if (aliases.length) {
-      const gated = compsUsed.filter((c) => {
-        const t = normalize(c.title);
-        return aliases.some((a) => t.includes(a));
-      });
-      if (gated.length >= 4) compsUsed = gated; // only accept if still enough
-    }
-
-    // 2) Sanity band vs asking (tunable)
-    // Keeps results from including totally different categories (e.g. Birkin sneaking in)
-    const banded = compsUsed.filter((c) => {
-      const p = c.price.amount;
-      return Number.isFinite(p) && p > 0 && p >= asking * 0.25 && p <= asking * 4;
-    });
-    if (banded.length >= 4) compsUsed = banded;
-
-    // 3) IQR outlier removal
-    const pricesForIqr = compsUsed
-      .map((c) => c.price.amount)
-      .filter((n) => Number.isFinite(n) && n > 0);
-
-    const { lo, hi } = iqrBounds(pricesForIqr);
-    const iqrFiltered = compsUsed.filter((c) => c.price.amount >= lo && c.price.amount <= hi);
-    if (iqrFiltered.length >= 4) compsUsed = iqrFiltered;
-    // --- End robust filtering ---
+    const comps = compsSameCurrency.length >= 4 ? compsSameCurrency : compsAll;
 
     // Build payload using comps if enough
     let payload: any;
 
-    if (compsUsed.length >= 4) {
-      const prices = compsUsed
+    if (comps.length >= 4) {
+      const prices = comps
         .map((c) => c.price.amount)
         .filter((n) => Number.isFinite(n) && n > 0);
 
@@ -426,6 +551,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const high = percentile(prices, 0.75);
 
       // Deal score: asking vs median
+      const asking = body.price.amount;
       const ratio = asking / med; // <1 means good deal
 
       let score = 70;
@@ -440,11 +566,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         score >= 75 ? "B+" :
         score >= 65 ? "B" :
         score >= 55 ? "C+" : "C";
-
-      const confidence =
-        prices.length >= 16 ? "high" :
-        prices.length >= 10 ? "medium" :
-        "low";
 
       payload = {
         deal: {
@@ -462,30 +583,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             low: { amount: Math.round(low), currency: body.price.currency },
             high: { amount: Math.round(high), currency: body.price.currency },
           },
-          confidence,
+          confidence: prices.length >= 12 ? "high" : (prices.length >= 7 ? "medium" : "low"),
           method: "active-comps-median",
         },
-        comps: compsUsed.slice(0, 12),
+        comps: comps.slice(0, 12),
         meta: {
           compsType: "active",
           query,
           marketplaceId,
+          filter,
           totalCompsFound: compsAll.length,
-          compsUsed: compsUsed.length,
-          filters: {
-            brandGate: aliases.length ? aliases : null,
-            sanityBand: { min: asking * 0.25, max: asking * 4 },
-            iqr: pricesForIqr.length >= 8 ? true : false,
-          },
         },
       };
     } else {
-      // 4) Fallback heuristic (still sane!)
-      const est = asking * 0.93; // slightly under asking for "expected resale" (tunable)
+      // Fallback heuristic (still sane)
+      const asking = body.price.amount;
+      const est = asking * 0.93;
       const low = asking * 0.84;
       const high = asking * 1.02;
 
-      // Score heuristic
       const ratio = asking / est;
       let score = 62;
       if (ratio <= 0.95) score = 74;
@@ -505,7 +621,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           explanationBullets: [
             "Not enough matching comps found via eBay search (active listings).",
             "Using heuristic estimate based on asking price and basic signals.",
-            "Next: improve search query parsing (model/size) for tighter comps.",
+            "Next: improve model/size parsing for tighter comps.",
           ],
         },
         estimate: {
@@ -514,7 +630,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             low: { amount: Math.round(low), currency: body.price.currency },
             high: { amount: Math.round(high), currency: body.price.currency },
           },
-          confidence: "medium",
+          confidence: "low",
           method: "fallback-heuristic",
         },
         comps: compsAll.slice(0, 12),
@@ -522,8 +638,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           compsType: "heuristic",
           query,
           marketplaceId,
+          filter,
           totalCompsFound: compsAll.length,
-          compsUsed: compsUsed.length,
         },
       };
     }
@@ -548,9 +664,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({ ...payload, cached: false });
   } catch (err: any) {
     console.error(err);
-    return res.status(500).json({
-      error: "Internal error",
-      detail: err?.message || String(err),
-    });
+    return res.status(500).json({ error: "Internal error", detail: err?.message || String(err) });
   }
 }
