@@ -63,35 +63,13 @@ type Comp = {
 
 let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
 
-type DealLabel = "great_deal" | "fair_price" | "overpriced";
-
-function dealLabelFromRatio(ratio: number): DealLabel {
-  if (!Number.isFinite(ratio) || ratio <= 0) return "fair_price";
-  if (ratio <= 0.88) return "great_deal";
-  if (ratio <= 1.05) return "fair_price";
-  return "overpriced";
-}
-
-function dealLabelMeta(label: DealLabel) {
-  switch (label) {
-    case "great_deal":
-      return { title: "Great deal", emoji: "🟢" };
-    case "fair_price":
-      return { title: "Fair price", emoji: "🟡" };
-    case "overpriced":
-      return { title: "Overpriced", emoji: "🔴" };
-  }
-}
-
-
 /**
- * ===== DEAL LABELS (user-friendly) =====
+ * ===== USER-FRIENDLY DEAL LABELS =====
  */
 type DealLabel = "great_deal" | "fair_price" | "overpriced";
 
 function dealLabelFromRatio(ratio: number): DealLabel {
-  // ratio = asking / comp_median
-  // lower ratio => better deal
+  // ratio = asking / compMedian
   if (!Number.isFinite(ratio) || ratio <= 0) return "fair_price";
   if (ratio <= 0.88) return "great_deal";
   if (ratio <= 1.05) return "fair_price";
@@ -146,7 +124,6 @@ async function getEbayAppToken(): Promise<string> {
 
 /**
  * ===== EBAY BROWSE SEARCH (ACTIVE comps) =====
- * Uses Browse API item_summary/search.
  */
 async function fetchActiveComps(params: {
   query: string;
@@ -287,9 +264,6 @@ function cleanTitleForSearch(title: string): string {
   return t;
 }
 
-/**
- * Keep size tokens like 25/30/35/40 (important for B/K + many bags)
- */
 const ALLOWED_SIZES = new Set([
   "15",
   "18",
@@ -426,7 +400,7 @@ function buildNegativeTerms(body: AnalyzeRequest): string[] {
 }
 
 /**
- * Light model extraction: good enough for ranking + query tightening.
+ * Light model extraction
  */
 function extractModelHint(body: AnalyzeRequest): string | null {
   const t = normalize(body.title || "");
@@ -493,9 +467,6 @@ function buildSearchQuery(body: AnalyzeRequest): string {
   return [brandPart, core, negativeStr].filter(Boolean).join(" ").trim();
 }
 
-/**
- * Browse API filter builder.
- */
 function buildBrowseFilter(body: AnalyzeRequest): string {
   const parts: string[] = [];
   parts.push("buyingOptions:{FIXED_PRICE|AUCTION}");
@@ -523,7 +494,6 @@ function marketplaceIdFromUrl(_url: string): string {
 /**
  * ===== COMP QUALITY RANKING (generic) =====
  */
-
 const JUNK_PHRASES = [
   "strap",
   "shoulder strap",
@@ -622,7 +592,6 @@ function buildTargetSignals(body: AnalyzeRequest) {
   const modelHint = extractModelHint(body);
 
   const coreTokens = tokenizeCore(titleClean);
-
   const modelTokens = modelHint?.split(" ").map(normalize).filter(Boolean) || [];
   const brandTokens = brand ? brand.split(" ").map((x) => x.trim()).filter(Boolean) : [];
   const negatives = buildNegativeTerms(body);
@@ -809,8 +778,7 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
 
 function confidenceFromQuality(usedForStats: Comp[]): "high" | "medium" | "low" {
   if (usedForStats.length >= 10) {
-    const avg =
-      usedForStats.reduce((s, c) => s + (c.qualityScore || 0), 0) / usedForStats.length;
+    const avg = usedForStats.reduce((s, c) => s + (c.qualityScore || 0), 0) / usedForStats.length;
     if (avg >= 78) return "high";
     if (avg >= 68) return "medium";
     return "low";
@@ -878,10 +846,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       user = newUser;
     }
 
-    // 2) Cache key
+    // 2) Cache key  (BUMP VERSION HERE to force fresh responses)
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-      `active-comps:v3:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
+      `active-comps:v99:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
         (body as any)?.cacheBuster || ""
       }`
     );
@@ -932,9 +900,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const high = percentile(prices, 0.75);
 
       const asking = body.price.amount;
-      const ratio = asking / med;
+      const ratio = asking / med; // <1 means good deal
 
-      // Keep your numeric score (internal)
+      // Keep numeric score internally (optional)
       let score = 70;
       if (ratio <= 0.85) score = 88;
       else if (ratio <= 0.95) score = 80;
@@ -942,6 +910,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       else if (ratio <= 1.15) score = 58;
       else score = 48;
 
+      // ✅ NEW LABELS (replaces A/B/C)
       const label = dealLabelFromRatio(ratio);
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
 
@@ -949,10 +918,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       payload = {
         deal: {
-          label, // great_deal | fair_price | overpriced
+          label,
           labelTitle,
           labelEmoji,
-          score, // keep for debug/power users
+          score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
             `Estimate based on top-quality eBay comps (active listings): ${usedForStats.length} used.`,
@@ -971,6 +940,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
         comps: compsForUI,
         meta: {
+          backendVersion: "deal-labels-v1",
           compsType: "active",
           query,
           marketplaceId,
@@ -982,7 +952,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
       };
     } else {
-      // Limited comps: still return a simple label, no letter grade, no "heuristic" wording in deal
+      // Limited comps: don't show letters, still return label (default fair price)
       const asking = body.price.amount;
       const est = asking * 0.93;
       const low = asking * 0.84;
@@ -995,7 +965,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       else if (ratio <= 1.05) score = 62;
       else score = 54;
 
-      // Default to fair price when we can't build robust comp median
       const label: DealLabel = "fair_price";
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
 
@@ -1023,6 +992,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
         comps: compsForUI.length ? compsForUI : compsAll.slice(0, 12),
         meta: {
+          backendVersion: "deal-labels-v1",
           compsType: "limited",
           query,
           marketplaceId,
