@@ -2,8 +2,18 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 
+/**
+ * ===== ENV =====
+ */
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || "";
+const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET || "";
+const EBAY_ENV = (process.env.EBAY_ENV || "PROD").toUpperCase(); // PROD | SANDBOX
+
+const EBAY_BASE =
+  EBAY_ENV === "SANDBOX" ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -11,6 +21,9 @@ function sha256(input: string) {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+/**
+ * ===== TYPES =====
+ */
 type AnalyzeRequest = {
   source: "ebay";
   url: string;
@@ -20,28 +33,243 @@ type AnalyzeRequest = {
   condition?: string;
   brand?: string;
   categoryHint?: string;
+
+  // optional (sent from content.js)
+  cacheBuster?: string;
+  debugPriceRaw?: string;
 };
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // --- CORS (allow browser + extension calls) ---
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
+type Comp = {
+  title: string;
+  price: { amount: number; currency: string };
+  condition?: string;
+  url: string;
+  itemId?: string;
+};
 
-  // Handle preflight request
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
+
+/**
+ * ===== EBAY TOKEN (App token) =====
+ * Uses OAuth client_credentials grant.
+ */
+async function getEbayAppToken(): Promise<string> {
+  const now = Date.now();
+  if (tokenCache && tokenCache.expiresAtMs > now + 30_000) {
+    return tokenCache.accessToken;
   }
 
+  if (!EBAY_CLIENT_ID || !EBAY_CLIENT_SECRET) {
+    throw new Error("Missing EBAY_CLIENT_ID / EBAY_CLIENT_SECRET env vars");
+  }
+
+  const basic = Buffer.from(`${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`).toString("base64");
+
+  const res = await fetch(`${EBAY_BASE}/identity/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Basic ${basic}`,
+    },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      scope: "https://api.ebay.com/oauth/api_scope",
+    }).toString(),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`eBay token error (${res.status}): ${txt}`);
+  }
+
+  const json = (await res.json()) as { access_token: string; expires_in: number };
+  tokenCache = { accessToken: json.access_token, expiresAtMs: now + json.expires_in * 1000 };
+
+  return tokenCache.accessToken;
+}
+
+/**
+ * ===== EBAY BROWSE SEARCH (ACTIVE comps) =====
+ * Browse API is active listings; this is our "real comps now" source.
+ */
+async function fetchActiveComps(params: {
+  query: string;
+  limit: number;
+  marketplaceId: string; // e.g., EBAY_US
+  currency: string;
+}): Promise<Comp[]> {
+  const token = await getEbayAppToken();
+
+  const q = params.query.trim().slice(0, 140);
+  const url = new URL(`${EBAY_BASE}/buy/browse/v1/item_summary/search`);
+  url.searchParams.set("q", q);
+  url.searchParams.set("limit", String(params.limit));
+  url.searchParams.set("filter", "buyingOptions:{FIXED_PRICE|AUCTION}");
+
+  const res = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "X-EBAY-C-MARKETPLACE-ID": params.marketplaceId,
+    },
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Browse search error (${res.status}): ${txt}`);
+  }
+
+  const json = await res.json();
+  const items = (json?.itemSummaries || []) as any[];
+
+  const comps: Comp[] = items
+    .map((it) => {
+      const amount = Number(it?.price?.value);
+      const currency = it?.price?.currency || params.currency;
+      if (!Number.isFinite(amount) || amount <= 0) return null;
+
+      return {
+        title: String(it?.title || "").slice(0, 160),
+        price: { amount, currency },
+        condition: it?.condition,
+        url: it?.itemWebUrl || it?.itemHref || "",
+        itemId: it?.itemId,
+      } as Comp;
+    })
+    .filter(Boolean)
+    .filter((c: Comp) => !!c.url);
+
+  return comps;
+}
+
+/**
+ * ===== STATS HELPERS =====
+ */
+function median(nums: number[]): number {
+  const arr = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(arr.length / 2);
+  return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+}
+
+function percentile(nums: number[], p: number): number {
+  const arr = [...nums].sort((a, b) => a - b);
+  const idx = (arr.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return arr[lo];
+  return arr[lo] + (arr[hi] - arr[lo]) * (idx - lo);
+}
+
+function looksLikeBag(text: string) {
+  const bagSignals = [
+    "bag",
+    "handbag",
+    "tote",
+    "flap",
+    "hobo",
+    "satchel",
+    "shoulder bag",
+    "crossbody",
+    "kelly",
+    "birkin",
+    "chanel",
+    "hermes",
+    "hermès",
+    "louis vuitton",
+    "lv",
+    "dior",
+    "prada",
+    "gucci",
+    "celine",
+    "fendi",
+    "ysl",
+    "saint laurent",
+  ];
+  const t = text.toLowerCase();
+  return bagSignals.some((s) => t.includes(s));
+}
+
+/**
+ * ===== QUERY CLEANING (IMPORTANT) =====
+ * Reduce noisy titles so eBay search returns tight comps.
+ */
+function cleanTitleForSearch(title: string): string {
+  let t = (title || "")
+    .replace(/[^\w\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const stopPhrases = [
+    "original",
+    "authentic",
+    "100% authentic",
+    "genuine",
+    "w/ all paperwork",
+    "with all paperwork",
+    "with paperwork",
+    "all paperwork",
+    "paperwork",
+    "receipt",
+    "dust bag",
+    "box",
+    "tags",
+    "new",
+    "brand new",
+    "nwt",
+    "mint",
+    "rare",
+  ];
+
+  const lowered = t.toLowerCase();
+  for (const s of stopPhrases) {
+    const re = new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+    t = t.replace(re, " ");
+  }
+
+  // collapse spaces again
+  t = t.replace(/\s+/g, " ").trim();
+  return t;
+}
+
+function buildSearchQuery(body: AnalyzeRequest): string {
+  const title = cleanTitleForSearch(body.title || "");
+  const brand = (body.brand || "").trim();
+
+  // If title already contains brand, keep title as-is.
+  if (brand && title.toLowerCase().includes(brand.toLowerCase())) return title;
+
+  // Otherwise prefix brand for better match.
+  if (brand) return `${brand} ${title}`.trim();
+
+  return title;
+}
+
+/**
+ * Simple marketplace mapping (keep EBAY_US for now).
+ * Later we can map by domain (.fr/.it/.de), but this is fine for v1.
+ */
+function marketplaceIdFromUrl(url: string): string {
+  // You can extend later: EBAY_GB, EBAY_DE, EBAY_FR, EBAY_IT...
+  return "EBAY_US";
+}
+
+/**
+ * ===== MAIN HANDLER =====
+ */
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    // Basic config check
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
       return res.status(500).json({ error: "Missing Supabase env vars" });
     }
 
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed. Use POST." });
-    }
+    // CORS
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
+
+    if (req.method === "OPTIONS") return res.status(204).end();
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed. Use POST." });
+
+    const noCache = String((req.query as any)?.nocache || "") === "1";
 
     const deviceIdHeader = req.headers["x-device-id"];
     const deviceId = typeof deviceIdHeader === "string" ? deviceIdHeader : null;
@@ -51,7 +279,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const body = req.body as AnalyzeRequest;
 
-    // Minimal validation
     if (!body?.source || body.source !== "ebay") {
       return res.status(400).json({ error: "Only source=ebay supported (Phase 1)" });
     }
@@ -59,281 +286,186 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "Missing title/price" });
     }
 
-    // Bags-only coarse filter (Phase 1)
-    const bagSignals = [
-      "bag",
-      "handbag",
-      "tote",
-      "flap",
-      "hobo",
-      "satchel",
-      "shoulder bag",
-      "kelly",
-      "birkin",
-      "chanel",
-      "hermes",
-      "hermès",
-      "louis vuitton",
-      "lv",
-      "dior"
-    ];
     const text = `${body.title} ${body.categoryHint || ""} ${body.brand || ""}`.toLowerCase();
-    const looksLikeBag = bagSignals.some((s) => text.includes(s));
-    if (!looksLikeBag) {
+    if (!looksLikeBag(text)) {
       return res.status(400).json({ error: "Phase 1 supports bags only" });
     }
 
-    // 1) Get or create user by device_id
+    // 1) Get or create user
     const { data: existingUser, error: userFetchErr } = await supabase
       .from("users")
       .select("*")
       .eq("device_id", deviceId)
       .maybeSingle();
-
     if (userFetchErr) throw userFetchErr;
 
     let user = existingUser;
     if (!user) {
       const { data: newUser, error: userCreateErr } = await supabase
         .from("users")
-        .insert({ device_id: deviceId, plan: "free", credits_remaining: 3 })
+        .insert({ device_id: deviceId, plan: "free", credits_remaining: 0 })
         .select("*")
         .single();
-
       if (userCreateErr) throw userCreateErr;
       user = newUser;
     }
 
-// 2) Enforce credits (DISABLED FOR TESTING)
-// if (user.plan === "free" && user.credits_remaining <= 0) {
-//   return res.status(402).json({
-//     error: "No credits remaining",
-//     paywall: true,
-//     credits: { plan: user.plan, remaining: 0 }
-//   });
-// }
-
-
-    // 3) Cache key (for later: real eBay calls)
+    // 2) Cache key
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-  `active-comps:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${(body as any)?.cacheBuster || ""}`
-);
+      `active-comps:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${(body as any)?.cacheBuster || ""}`
+    );
 
+    // Read cache (unless nocache=1)
     const now = new Date();
+    if (!noCache) {
+      const { data: cached } = await supabase
+        .from("cache")
+        .select("value_json, expires_at")
+        .eq("key", cacheKey)
+        .maybeSingle();
 
-    const { data: cached } = await supabase
-      .from("cache")
-      .select("value_json, expires_at")
-      .eq("key", cacheKey)
-      .maybeSingle();
+      const cacheValid =
+        cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
-    const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
-
-async function decrementCreditsIfFree() {
-  // Credits disabled for testing
-  return user.credits_remaining;
-}
-
-
-    if (cacheValid && cached?.value_json) {
-      const remaining = await decrementCreditsIfFree();
-      return res.status(200).json({
-        ...(cached.value_json as any),
-        credits: { plan: user.plan, remaining },
-        cached: true
-      });
+      if (cacheValid && cached?.value_json) {
+        return res.status(200).json({ ...(cached.value_json as any), cached: true });
+      }
     }
 
-    // 4) SIMPLE (NON-MOCK) heuristics (Phase 1)
-// Goal: vary output by brand + condition + price without calling eBay yet.
+    // 3) Fetch ACTIVE comps
+    const query = buildSearchQuery(body);
+    const marketplaceId = marketplaceIdFromUrl(body.url);
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
+    const compsAll = await fetchActiveComps({
+      query,
+      limit: 24,
+      marketplaceId,
+      currency: body.price.currency,
+    });
 
-type Tier = {
-  name: string;
-  retention: number; // expected resale retention vs listing price proxy (until comps)
-  confidence: "low" | "medium";
-};
+    // Filter comps to same currency if possible
+    const compsSameCurrency = compsAll.filter((c) => c.price.currency === body.price.currency);
+    const comps = compsSameCurrency.length >= 4 ? compsSameCurrency : compsAll;
 
-const BRAND_TIERS: Record<string, Tier> = {
-  hermes: { name: "Ultra-luxury", retention: 0.98, confidence: "medium" },
-  "hermès": { name: "Ultra-luxury", retention: 0.98, confidence: "medium" },
-  chanel: { name: "Ultra-luxury", retention: 0.92, confidence: "medium" },
-  "louis vuitton": { name: "Luxury", retention: 0.86, confidence: "medium" },
-  lv: { name: "Luxury", retention: 0.86, confidence: "medium" },
-  dior: { name: "Luxury", retention: 0.84, confidence: "medium" },
-  gucci: { name: "Luxury", retention: 0.78, confidence: "medium" },
-  prada: { name: "Luxury", retention: 0.76, confidence: "medium" },
-  celine: { name: "Luxury", retention: 0.75, confidence: "medium" },
-  fendi: { name: "Luxury", retention: 0.74, confidence: "medium" },
-  balenciaga: { name: "Luxury", retention: 0.70, confidence: "medium" },
-  ysl: { name: "Luxury", retention: 0.72, confidence: "medium" },
-  "saint laurent": { name: "Luxury", retention: 0.72, confidence: "medium" },
-};
+    // Build payload using comps if enough
+    let payload: any;
 
-const DEFAULT_TIER: Tier = { name: "Unknown", retention: 0.68, confidence: "low" };
+    if (comps.length >= 4) {
+      const prices = comps
+        .map((c) => c.price.amount)
+        .filter((n) => Number.isFinite(n) && n > 0);
 
-// Condition multipliers (applied to expected resale)
-const CONDITION_MULT: Record<string, { label: string; mult: number }> = {
-  new: { label: "New", mult: 1.08 },
-  "new with tags": { label: "New with tags", mult: 1.12 },
-  "like new": { label: "Like new", mult: 1.05 },
-  "excellent": { label: "Excellent", mult: 1.02 },
-  "very good": { label: "Very good", mult: 1.0 },
-  "good": { label: "Good", mult: 0.90 },
-  "fair": { label: "Fair", mult: 0.78 },
-  "poor": { label: "Poor", mult: 0.65 },
-};
+      const med = median(prices);
+      const low = percentile(prices, 0.25);
+      const high = percentile(prices, 0.75);
 
-function inferBrand(text: string): string | null {
-  const t = text.toLowerCase();
-  const keys = Object.keys(BRAND_TIERS).sort((a, b) => b.length - a.length);
-  for (const k of keys) {
-    if (t.includes(k)) return k;
-  }
-  return null;
-}
+      // Deal score: asking vs median
+      const asking = body.price.amount;
+      const ratio = asking / med; // <1 means good deal
 
-function inferCondition(text: string): { key: string; label: string; mult: number } {
-  const t = text.toLowerCase();
+      let score = 70;
+      if (ratio <= 0.85) score = 88;
+      else if (ratio <= 0.95) score = 80;
+      else if (ratio <= 1.05) score = 68;
+      else if (ratio <= 1.15) score = 58;
+      else score = 48;
 
-  // Quick signals
-  if (t.includes("nwt") || t.includes("new with tags")) return { key: "new with tags", ...CONDITION_MULT["new with tags"] };
-  if (t.includes("brand new") || t.includes("bnwt") || t.includes("new")) return { key: "new", ...CONDITION_MULT["new"] };
-  if (t.includes("like new") || t.includes("as new")) return { key: "like new", ...CONDITION_MULT["like new"] };
-  if (t.includes("excellent")) return { key: "excellent", ...CONDITION_MULT["excellent"] };
-  if (t.includes("very good")) return { key: "very good", ...CONDITION_MULT["very good"] };
-  if (t.includes("good")) return { key: "good", ...CONDITION_MULT["good"] };
-  if (t.includes("fair")) return { key: "fair", ...CONDITION_MULT["fair"] };
-  if (t.includes("poor") || t.includes("damaged") || t.includes("damage")) return { key: "poor", ...CONDITION_MULT["poor"] };
+      const rating =
+        score >= 85 ? "A" :
+        score >= 75 ? "B+" :
+        score >= 65 ? "B" :
+        score >= 55 ? "C+" : "C";
 
-  // Default if unknown
-  return { key: "very good", ...CONDITION_MULT["very good"] };
-}
+      payload = {
+        deal: {
+          rating,
+          score,
+          explanationBullets: [
+            "Estimate based on real eBay comps (active listings).",
+            `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
+            "Next: swap active comps → SOLD comps when access/data source is available.",
+          ],
+        },
+        estimate: {
+          resaleValue: { amount: Math.round(med), currency: body.price.currency },
+          range: {
+            low: { amount: Math.round(low), currency: body.price.currency },
+            high: { amount: Math.round(high), currency: body.price.currency },
+          },
+          confidence: prices.length >= 12 ? "medium" : "low",
+          method: "active-comps-median",
+        },
+        comps: comps.slice(0, 12),
+        meta: { compsType: "active", query, marketplaceId, totalCompsFound: compsAll.length },
+      };
+    } else {
+      // 4) Fallback heuristic (still sane!)
+      const asking = body.price.amount;
+      const est = asking * 0.93; // slightly under asking for "expected resale" (tunable)
+      const low = asking * 0.84;
+      const high = asking * 1.02;
 
-// Build combined text for inference
-const combinedText = `${body.title} ${body.brand || ""} ${body.condition || ""} ${body.categoryHint || ""}`;
+      // Score heuristic
+      const ratio = asking / est;
+      let score = 62;
+      if (ratio <= 0.95) score = 74;
+      else if (ratio <= 1.05) score = 62;
+      else score = 54;
 
-// Infer brand tier
-const inferredBrandKey = inferBrand(combinedText) || (body.brand ? inferBrand(body.brand) : null);
-const tier = inferredBrandKey ? BRAND_TIERS[inferredBrandKey] : DEFAULT_TIER;
+      const rating =
+        score >= 85 ? "A" :
+        score >= 75 ? "B+" :
+        score >= 65 ? "B" :
+        score >= 55 ? "C+" : "C";
 
-// Infer condition
-const cond = inferCondition(combinedText);
+      payload = {
+        deal: {
+          rating,
+          score,
+          explanationBullets: [
+            "Not enough matching comps found via eBay search (active listings).",
+            "Using heuristic estimate based on asking price and basic signals.",
+            "Next: improve search query parsing (model/size) for tighter comps.",
+          ],
+        },
+        estimate: {
+          resaleValue: { amount: Math.round(est), currency: body.price.currency },
+          range: {
+            low: { amount: Math.round(low), currency: body.price.currency },
+            high: { amount: Math.round(high), currency: body.price.currency },
+          },
+          confidence: "medium",
+          method: "fallback-heuristic",
+        },
+        comps: compsAll.slice(0, 12),
+        meta: { compsType: "heuristic", query, marketplaceId, totalCompsFound: compsAll.length },
+      };
+    }
 
-// Estimate resale value (heuristic)
-const base = body.price.amount;
-const estimatedResale = Math.round(base * tier.retention * cond.mult);
-
-// Deal score: compare asking price vs estimated resale
-// If asking price is below estimate => good deal
-const delta = (estimatedResale - base) / Math.max(estimatedResale, 1); // -1..+1-ish
-let score = Math.round(60 + delta * 80); // center at 60, swings with delta
-score = clamp(score, 5, 98);
-
-// Rating bands
-let rating = "C";
-if (score >= 90) rating = "A";
-else if (score >= 80) rating = "A-";
-else if (score >= 72) rating = "B+";
-else if (score >= 65) rating = "B";
-else if (score >= 55) rating = "B-";
-else if (score >= 45) rating = "C+";
-else if (score >= 35) rating = "C";
-else rating = "D";
-
-// Confidence + range width
-const confidence = tier.confidence;
-const rangeWidth =
-  confidence === "medium" ? 0.10 : 0.18; // +/-10% or +/-18%
-
-const low = Math.round(estimatedResale * (1 - rangeWidth));
-const high = Math.round(estimatedResale * (1 + rangeWidth));
-
-// Explanation bullets (dynamic)
-const brandLabel = inferredBrandKey ? inferredBrandKey.toUpperCase() : "UNKNOWN BRAND";
-const bullets = [
-  `Brand signal: ${brandLabel} (${tier.name} tier).`,
-  `Condition adjustment: ${cond.label} (${Math.round((cond.mult - 1) * 100)}%).`,
-];
-
-if (estimatedResale > base) {
-  bullets.push(`Asking price looks below estimated resale → stronger deal.`);
-} else if (estimatedResale < base) {
-  bullets.push(`Asking price looks above estimated resale → weaker deal.`);
-} else {
-  bullets.push(`Asking price aligns with estimated resale.`);
-}
-
-bullets.push(`No sold comps yet (next step). This is a heuristic estimate.`);
-
-// “Pseudo comps” (still not real solds, but now derived from estimate)
-const comps = [
-  {
-    title: `Comparable (heuristic) — ${cond.label}`,
-    soldPrice: { amount: Math.round(estimatedResale * 0.96), currency: body.price.currency },
-    soldDate: "Heuristic",
-    condition: cond.label,
-    url: "https://example.com"
-  },
-  {
-    title: `Comparable (heuristic) — ${cond.label}`,
-    soldPrice: { amount: Math.round(estimatedResale * 1.03), currency: body.price.currency },
-    soldDate: "Heuristic",
-    condition: cond.label,
-    url: "https://example.com"
-  }
-];
-
-const payload = {
-  deal: {
-    rating,
-    score,
-    explanationBullets: bullets
-  },
-  estimate: {
-    resaleValue: { amount: estimatedResale, currency: body.price.currency },
-    range: {
-      low: { amount: low, currency: body.price.currency },
-      high: { amount: high, currency: body.price.currency }
-    },
-    confidence
-  },
-  comps
-};
-
-
-    // 5) Save cache (24h)
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    // 5) Cache (6h)
+    const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
     await supabase.from("cache").upsert({
       key: cacheKey,
       value_json: payload,
-      expires_at: expiresAt
+      expires_at: expiresAt,
     });
 
-    // 6) Save analysis log
+    // 6) Log analysis
     await supabase.from("analyses").insert({
       user_id: user.id,
       source: body.source,
       item_key: itemKey,
       input_json: body,
-      output_json: payload
+      output_json: payload,
     });
 
-    // 7) Decrement credits and respond
-    const remaining = await decrementCreditsIfFree();
-
-    return res.status(200).json({
-      ...payload,
-      credits: { plan: user.plan, remaining },
-      cached: false
-    });
+    return res.status(200).json({ ...payload, cached: false });
   } catch (err: any) {
     console.error(err);
     return res.status(500).json({ error: "Internal error", detail: err?.message || String(err) });
   }
 }
+
+ 
 
