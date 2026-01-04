@@ -32,6 +32,11 @@ function normalize(s: string): string {
 }
 
 /**
+
+const EBAY_FINDING_ENDPOINT = "https://svcs.ebay.com/services/search/FindingService/v1";
+// For Finding API completed items. This is your AppID = EBAY_CLIENT_ID.
+const EBAY_APP_ID = EBAY_CLIENT_ID || "";
+
  * ===== TYPES =====
  */
 type AnalyzeRequest = {
@@ -60,6 +65,11 @@ type Comp = {
   qualityScore?: number;
   qualityWhy?: string[];
 };
+
+type SoldComp = Comp & {
+  soldDate?: string; // ISO date string
+};
+
 
 let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
 
@@ -854,6 +864,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       filter,
     });
 
+// 3a) Fetch SOLD comps (preferred)
+const useSoldComps = true; // ← temporary hard switch
+
+let compsAll: any[] = [];
+
+if (useSoldComps) {
+  compsAll = await fetchSoldComps({
+    query,
+    limit: 100,
+    marketplaceId,
+    currency: body.price.currency,
+    daysBack: 90,
+  });
+} else {
+  // 3b) Fetch ACTIVE comps (fallback)
+  compsAll = await fetchActiveComps({
+    query,
+    limit: 30,
+    marketplaceId,
+    currency: body.price.currency,
+    filter,
+  });
+}
+
+    
     // 4) Rank + filter comps
     const { ranked, usedForStats, debug } = rankAndFilterComps(body, compsAll);
     const compsForUI = ranked.slice(0, 12);
