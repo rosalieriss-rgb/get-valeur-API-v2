@@ -891,9 +891,8 @@ for (const days of SOLD_WINDOWS) {
     // ignore and try next window
   }
 }
-
-// 3B) Fallback to ACTIVE only if SOLD is truly insufficient
-if (compsAll.length < MIN_COMPS) {
+// 3B) Fallback to ACTIVE ONLY if SOLD returned nothing
+if (compsAll.length === 0) {
   compsSource = "active";
   windowDays = null;
 
@@ -904,7 +903,11 @@ if (compsAll.length < MIN_COMPS) {
     currency: body.price.currency,
     filter,
   });
+} else {
+  compsSource = "sold";
+  // windowDays is already set to the best window we found (90/180/365)
 }
+
 
 
     
