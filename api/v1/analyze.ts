@@ -15,6 +15,13 @@ const EBAY_ENV = (process.env.EBAY_ENV || "PROD").toUpperCase(); // PROD | SANDB
 const EBAY_BASE =
   EBAY_ENV === "SANDBOX" ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
 
+// Finding API (CompletedItems) uses the legacy endpoint and AppID (Client ID)
+const EBAY_FINDING_ENDPOINT =
+  EBAY_ENV === "SANDBOX"
+    ? "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
+    : "https://svcs.ebay.com/services/search/FindingService/v1";
+const EBAY_APP_ID = EBAY_CLIENT_ID || "";
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 function sha256(input: string) {
@@ -32,11 +39,6 @@ function normalize(s: string): string {
 }
 
 /**
-
-const EBAY_FINDING_ENDPOINT = "https://svcs.ebay.com/services/search/FindingService/v1";
-// For Finding API completed items. This is your AppID = EBAY_CLIENT_ID.
-const EBAY_APP_ID = EBAY_CLIENT_ID || "";
-
  * ===== TYPES =====
  */
 type AnalyzeRequest = {
@@ -69,7 +71,6 @@ type Comp = {
 type SoldComp = Comp & {
   soldDate?: string; // ISO date string
 };
-
 
 let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
 
@@ -183,6 +184,98 @@ async function fetchActiveComps(params: {
     .filter((c: Comp) => !!c.url);
 
   return comps;
+}
+
+/**
+ * ===== EBAY FINDING API (SOLD comps) =====
+ * Uses findCompletedItems. We keep it robust & simple.
+ */
+async function fetchSoldComps(params: {
+  query: string;
+  limit: number;
+  marketplaceId: string; // unused here, kept for signature consistency
+  currency: string;
+  daysBack: number;
+}): Promise<SoldComp[]> {
+  if (!EBAY_APP_ID) throw new Error("Missing EBAY_CLIENT_ID (AppID) for Finding API");
+
+  const q = params.query.trim().slice(0, 300);
+  const url = new URL(EBAY_FINDING_ENDPOINT);
+
+  // Finding API uses indexed itemFilter entries
+  const now = new Date();
+  const from = new Date(now.getTime() - params.daysBack * 24 * 60 * 60 * 1000);
+
+  const iso = (d: Date) => d.toISOString();
+
+  url.searchParams.set("OPERATION-NAME", "findCompletedItems");
+  url.searchParams.set("SERVICE-VERSION", "1.13.0");
+  url.searchParams.set("SECURITY-APPNAME", EBAY_APP_ID);
+  url.searchParams.set("RESPONSE-DATA-FORMAT", "JSON");
+  url.searchParams.set("REST-PAYLOAD", "true");
+
+  url.searchParams.set("keywords", q);
+  url.searchParams.set("paginationInput.entriesPerPage", String(Math.min(100, params.limit)));
+
+  // Only sold (not just ended)
+  url.searchParams.set("itemFilter(0).name", "SoldItemsOnly");
+  url.searchParams.set("itemFilter(0).value", "true");
+
+  // Date filter (endTimeFrom / endTimeTo)
+  url.searchParams.set("itemFilter(1).name", "EndTimeFrom");
+  url.searchParams.set("itemFilter(1).value", iso(from));
+  url.searchParams.set("itemFilter(2).name", "EndTimeTo");
+  url.searchParams.set("itemFilter(2).value", iso(now));
+
+  // Sort by most recent sold
+  url.searchParams.set("sortOrder", "EndTimeSoonest");
+
+  const res = await fetch(url.toString(), {
+    headers: { "Accept": "application/json" },
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Finding (sold) error (${res.status}): ${txt}`);
+  }
+
+  const json = await res.json();
+
+  const rawItems =
+    json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+
+  const out: SoldComp[] = (rawItems as any[])
+    .map((it) => {
+      const sellingStatus = it?.sellingStatus?.[0];
+      const priceObj = sellingStatus?.currentPrice?.[0];
+      const amount = Number(priceObj?.__value__);
+      const currency = String(priceObj?.["@currencyId"] || params.currency);
+
+      if (!Number.isFinite(amount) || amount <= 0) return null;
+
+      const url = String(it?.viewItemURL?.[0] || "");
+      const title = String(it?.title?.[0] || "").slice(0, 180);
+      const itemId = String(it?.itemId?.[0] || "");
+      const condition = String(it?.condition?.[0]?.conditionDisplayName?.[0] || "");
+
+      const soldDate = it?.listingInfo?.[0]?.endTime?.[0]
+        ? new Date(it.listingInfo[0].endTime[0]).toISOString()
+        : undefined;
+
+      if (!url) return null;
+
+      return {
+        title,
+        price: { amount, currency },
+        condition,
+        url,
+        itemId,
+        soldDate,
+      } as SoldComp;
+    })
+    .filter(Boolean);
+
+  return out;
 }
 
 /**
@@ -778,8 +871,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-device-id");
 
     if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "POST")
-      return res.status(405).json({ error: "Method not allowed. Use POST." });
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed. Use POST." });
 
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
       return res.status(500).json({ error: "Missing Supabase env vars" });
@@ -829,7 +921,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 2) Cache key (bump version to invalidate old cache)
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-      `active-comps:v100:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
+      `comps:v101:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
         (body as any)?.cacheBuster || ""
       }`
     );
@@ -843,80 +935,74 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .eq("key", cacheKey)
         .maybeSingle();
 
-      const cacheValid =
-        cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
+      const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
       if (cacheValid && cached?.value_json) {
         return res.status(200).json({ ...(cached.value_json as any), cached: true });
       }
     }
 
- // 3) Build query
-const query = buildSearchQuery(body);
-const marketplaceId = marketplaceIdFromUrl(body.url);
-const filter = buildBrowseFilter(body);
+    // 3) Build query + filters
+    const query = buildSearchQuery(body);
+    const marketplaceId = marketplaceIdFromUrl(body.url);
+    const filter = buildBrowseFilter(body);
 
-// 3A) Try SOLD first with expanding windows
-const SOLD_WINDOWS = [90, 180, 365];
-const MIN_COMPS = 12;
+    // 3A) Try SOLD first with expanding windows
+    const SOLD_WINDOWS = [90, 180, 365];
+    const MIN_COMPS = 12;
 
-let compsAll: any[] = [];
-let compsSource: "sold" | "active" = "sold";
-let windowDays: number | null = null;
+    let compsAll: Comp[] = [];
+    let compsSource: "sold" | "active" = "sold";
+    let windowDays: number | null = null;
 
-// Try SOLD windows progressively
-for (const days of SOLD_WINDOWS) {
-  try {
-    const sold = await fetchSoldComps({
-      query,
-      limit: 120, // fetch more, filter later
-      marketplaceId,
-      currency: body.price.currency,
-      daysBack: days, // <-- keep daysBack (matches your function)
-    });
+    for (const days of SOLD_WINDOWS) {
+      try {
+        const sold = await fetchSoldComps({
+          query,
+          limit: 120,
+          marketplaceId,
+          currency: body.price.currency,
+          daysBack: days,
+        });
 
-    // If we have enough, stop here
-    if (sold.length >= MIN_COMPS) {
-      compsAll = sold;
-      windowDays = days;
-      break;
+        if (sold.length >= MIN_COMPS) {
+          compsAll = sold;
+          windowDays = days;
+          break;
+        }
+
+        if (sold.length > compsAll.length) {
+          compsAll = sold;
+          windowDays = days;
+        }
+      } catch {
+        // ignore and try next window
+      }
     }
 
-    // Otherwise keep the best sold attempt so far
-    if (sold.length > compsAll.length) {
-      compsAll = sold;
-      windowDays = days;
+    // 3B) Fallback to ACTIVE ONLY if SOLD not enough
+    if (compsAll.length < MIN_COMPS) {
+      compsSource = "active";
+      windowDays = null;
+
+      compsAll = await fetchActiveComps({
+        query,
+        limit: 120,
+        marketplaceId,
+        currency: body.price.currency,
+        filter,
+      });
+    } else {
+      compsSource = "sold";
     }
-  } catch (e) {
-    // ignore and try next window
-  }
-}
-// 3B) Fallback to ACTIVE ONLY if SOLD returned nothing
-if (compsAll.length < MIN_COMPS) {
-  compsSource = "active";
-  windowDays = null;
 
+    const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
 
-  compsAll = await fetchActiveComps({
-    query,
-    limit: 120,
-    marketplaceId,
-    currency: body.price.currency,
-    filter,
-  });
-} else {
-  compsSource = "sold";
-  // windowDays is already set to the best window we found (90/180/365)
-}
-
-const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
-
-
-    
     // 4) Rank + filter comps
     const { ranked, usedForStats, debug } = rankAndFilterComps(body, compsAll);
     const compsForUI = ranked.slice(0, 12);
 
+    // 5) Build payload (FIXED: no broken object / no nested res.json)
     let payload: any;
 
     if (usedForStats.length >= 4) {
@@ -950,7 +1036,7 @@ const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            `Estimate based on top-quality eBay comps (active listings): ${usedForStats.length} used.`,
+            `Estimate based on top-quality eBay comps (${compsSource} listings): ${usedForStats.length} used.`,
             `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
             "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
           ],
@@ -962,54 +1048,21 @@ const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
             high: { amount: Math.round(high), currency: body.price.currency },
           },
           confidence,
-          method: "active-comps-median-top-quality",
+          method: compsSource === "sold" ? "sold-comps-median-top-quality" : "active-comps-median-top-quality",
         },
         comps: compsForUI,
-
-        return res.json({
-  deal,
-  estimate,
-  comps: compsForUI,
-        
-  meta: {
-    backendVersion: "sold-comps-v1",
-
-    // source of comps
-    compsSource,
-    windowDays,
-    compsType: compsSource, // backward compatibility handled here
-
-    soldCompsCount,
-
-    query,
-    marketplaceId,
-    filter,
-    compsFound,
-    keptAfterFiltering,
-    compsUsed,
-  },
-
-  cached,
-};
-
-
-  // backward compatibility
-  compsType: compsSource === "sold" ? "sold" : "active",
-
-  // 🔎 DEBUG / VISIBILITY
-  soldCompsCount: compsSource === "sold" ? compsAll.length : 0,
-
-  // existing fields
-  query,
-  marketplaceId,
-  filter,
-
-  compsFound: compsAll.length,
-  keptAfterFiltering: debug.counts.kept,
-  compsUsed: debug.counts.used,
-},
-
-
+        meta: {
+          backendVersion: "sold-comps-v1",
+          compsSource, // "sold" | "active"
+          windowDays, // 90/180/365 or null for active fallback
+          query,
+          marketplaceId,
+          filter,
+          compsFound: compsAll.length,
+          keptAfterFiltering: debug.counts.kept,
+          compsUsed: debug.counts.used,
+          soldCompsCount,
+        },
       };
     } else {
       // Limited comps: still return labels (no A/B/C)
@@ -1036,7 +1089,7 @@ const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            "Not enough high-quality matching comps found in active listings.",
+            `Not enough high-quality matching comps found (${compsSource} listings).`,
             "Showing a low-confidence estimate based on available signals.",
           ],
         },
@@ -1052,18 +1105,20 @@ const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
         comps: compsForUI.length ? compsForUI : compsAll.slice(0, 12),
         meta: {
           backendVersion: "deal-labels-v1",
-          compsType: "limited",
+          compsSource,
+          windowDays,
           query,
           marketplaceId,
           filter,
-          totalCompsFound: compsAll.length,
+          compsFound: compsAll.length,
           keptAfterFiltering: debug.counts.kept,
-          usedForStats: debug.counts.used,
+          compsUsed: debug.counts.used,
+          soldCompsCount,
         },
       };
     }
 
-    // 5) Cache (6h)
+    // 6) Cache (6h)
     const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
     await supabase.from("cache").upsert({
       key: cacheKey,
@@ -1071,7 +1126,7 @@ const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
       expires_at: expiresAt,
     });
 
-    // 6) Log analysis
+    // 7) Log analysis
     await supabase.from("analyses").insert({
       user_id: user.id,
       source: body.source,
