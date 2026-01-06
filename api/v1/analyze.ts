@@ -896,6 +896,7 @@ if (compsAll.length < MIN_COMPS) {
   compsSource = "active";
   windowDays = null;
 
+
   compsAll = await fetchActiveComps({
     query,
     limit: 120,
@@ -908,6 +909,7 @@ if (compsAll.length < MIN_COMPS) {
   // windowDays is already set to the best window we found (90/180/365)
 }
 
+const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
 
 
     
@@ -963,12 +965,28 @@ if (compsAll.length < MIN_COMPS) {
           method: "active-comps-median-top-quality",
         },
         comps: compsForUI,
-     meta: {
-  backendVersion: "sold-comps-v1",
 
-  // source of comps
-  compsSource,
-  windowDays,
+  meta: {
+    backendVersion: "sold-comps-v1",
+
+    // source of comps
+    compsSource,
+    windowDays,
+    compsType: compsSource, // backward compatibility handled here
+
+    soldCompsCount,
+
+    query,
+    marketplaceId,
+    filter,
+    compsFound,
+    keptAfterFiltering,
+    compsUsed,
+  },
+
+  cached,
+};
+
 
   // backward compatibility
   compsType: compsSource === "sold" ? "sold" : "active",
