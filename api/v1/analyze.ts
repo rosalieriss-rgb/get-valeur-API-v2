@@ -856,32 +856,50 @@ const query = buildSearchQuery(body);
 const marketplaceId = marketplaceIdFromUrl(body.url);
 const filter = buildBrowseFilter(body);
 
-// 3A) Try SOLD first
-const SOLD_WINDOW_DAYS = 90;
+// 3A) Try SOLD first with expanding windows
+const SOLD_WINDOWS = [90, 180, 365];
+const MIN_COMPS = 12;
+
 let compsAll: any[] = [];
 let compsSource: "sold" | "active" = "sold";
-let windowDays: number | null = SOLD_WINDOW_DAYS;
+let windowDays: number | null = null;
 
-try {
-  compsAll = await fetchSoldComps({
-    query,
-    limit: 100,
-    marketplaceId,
-    currency: body.price.currency,
-    daysBack: SOLD_WINDOW_DAYS, // <-- keep daysBack if that's what your function uses
-  });
-} catch (e) {
-  compsAll = [];
+// Try SOLD windows progressively
+for (const days of SOLD_WINDOWS) {
+  try {
+    const sold = await fetchSoldComps({
+      query,
+      limit: 120, // fetch more, filter later
+      marketplaceId,
+      currency: body.price.currency,
+      daysBack: days, // <-- keep daysBack (matches your function)
+    });
+
+    // If we have enough, stop here
+    if (sold.length >= MIN_COMPS) {
+      compsAll = sold;
+      windowDays = days;
+      break;
+    }
+
+    // Otherwise keep the best sold attempt so far
+    if (sold.length > compsAll.length) {
+      compsAll = sold;
+      windowDays = days;
+    }
+  } catch (e) {
+    // ignore and try next window
+  }
 }
 
-// 3B) Fallback to ACTIVE if too few sold
-if (compsAll.length < 12) {
+// 3B) Fallback to ACTIVE only if SOLD is truly insufficient
+if (compsAll.length < MIN_COMPS) {
   compsSource = "active";
   windowDays = null;
 
   compsAll = await fetchActiveComps({
     query,
-    limit: 100,
+    limit: 120,
     marketplaceId,
     currency: body.price.currency,
     filter,
