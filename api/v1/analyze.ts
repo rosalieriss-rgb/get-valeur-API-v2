@@ -966,6 +966,11 @@ const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
         },
         comps: compsForUI,
 
+        return res.json({
+  deal,
+  estimate,
+  comps: compsForUI,
+        
   meta: {
     backendVersion: "sold-comps-v1",
 
