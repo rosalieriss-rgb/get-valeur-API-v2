@@ -892,7 +892,7 @@ for (const days of SOLD_WINDOWS) {
   }
 }
 // 3B) Fallback to ACTIVE ONLY if SOLD returned nothing
-if (compsAll.length === 0) {
+if (compsAll.length < MIN_COMPS) {
   compsSource = "active";
   windowDays = null;
 
