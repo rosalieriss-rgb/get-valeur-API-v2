@@ -8,19 +8,15 @@ import crypto from "crypto";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
-const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || "";
+const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || ""; // also used as Finding API AppID
 const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET || "";
 const EBAY_ENV = (process.env.EBAY_ENV || "PROD").toUpperCase(); // PROD | SANDBOX
 
 const EBAY_BASE =
   EBAY_ENV === "SANDBOX" ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
 
-// Finding API (CompletedItems) uses the legacy endpoint and AppID (Client ID)
-const EBAY_FINDING_ENDPOINT =
-  EBAY_ENV === "SANDBOX"
-    ? "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
-    : "https://svcs.ebay.com/services/search/FindingService/v1";
-const EBAY_APP_ID = EBAY_CLIENT_ID || "";
+// Finding API (Completed/Sold) is a separate endpoint and uses AppID (client id)
+const EBAY_FINDING_ENDPOINT = "https://svcs.ebay.com/services/search/FindingService/v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -69,7 +65,7 @@ type Comp = {
 };
 
 type SoldComp = Comp & {
-  soldDate?: string; // ISO date string
+  soldDate?: string; // ISO date string (best effort)
 };
 
 let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
@@ -188,51 +184,58 @@ async function fetchActiveComps(params: {
 
 /**
  * ===== EBAY FINDING API (SOLD comps) =====
- * Uses findCompletedItems. We keep it robust & simple.
+ * Uses AppID (= EBAY_CLIENT_ID). Works without OAuth.
+ * We use findCompletedItems + SoldItemsOnly=true and a time window.
  */
+function findingGlobalIdFromMarketplace(marketplaceId: string): string {
+  // Keep it simple; you can extend later.
+  // For your current use (ebay.com), EBAY-US is correct.
+  if (marketplaceId === "EBAY_GB") return "EBAY-GB";
+  if (marketplaceId === "EBAY_DE") return "EBAY-DE";
+  if (marketplaceId === "EBAY_FR") return "EBAY-FR";
+  if (marketplaceId === "EBAY_IT") return "EBAY-IT";
+  return "EBAY-US";
+}
+
 async function fetchSoldComps(params: {
   query: string;
   limit: number;
-  marketplaceId: string; // unused here, kept for signature consistency
+  marketplaceId: string;
   currency: string;
   daysBack: number;
 }): Promise<SoldComp[]> {
-  if (!EBAY_APP_ID) throw new Error("Missing EBAY_CLIENT_ID (AppID) for Finding API");
+  if (!EBAY_CLIENT_ID) {
+    throw new Error("Missing EBAY_CLIENT_ID (used as Finding API AppID)");
+  }
 
-  const q = params.query.trim().slice(0, 300);
+  const keywords = params.query.trim().slice(0, 250);
+
+  const endTo = new Date();
+  const endFrom = new Date(Date.now() - params.daysBack * 24 * 60 * 60 * 1000);
+
   const url = new URL(EBAY_FINDING_ENDPOINT);
-
-  // Finding API uses indexed itemFilter entries
-  const now = new Date();
-  const from = new Date(now.getTime() - params.daysBack * 24 * 60 * 60 * 1000);
-
-  const iso = (d: Date) => d.toISOString();
-
   url.searchParams.set("OPERATION-NAME", "findCompletedItems");
   url.searchParams.set("SERVICE-VERSION", "1.13.0");
-  url.searchParams.set("SECURITY-APPNAME", EBAY_APP_ID);
+  url.searchParams.set("SECURITY-APPNAME", EBAY_CLIENT_ID);
   url.searchParams.set("RESPONSE-DATA-FORMAT", "JSON");
   url.searchParams.set("REST-PAYLOAD", "true");
+  url.searchParams.set("GLOBAL-ID", findingGlobalIdFromMarketplace(params.marketplaceId));
 
-  url.searchParams.set("keywords", q);
-  url.searchParams.set("paginationInput.entriesPerPage", String(Math.min(100, params.limit)));
+  url.searchParams.set("keywords", keywords);
+  url.searchParams.set("paginationInput.entriesPerPage", String(params.limit));
 
-  // Only sold (not just ended)
+  // itemFilter(s)
   url.searchParams.set("itemFilter(0).name", "SoldItemsOnly");
   url.searchParams.set("itemFilter(0).value", "true");
 
-  // Date filter (endTimeFrom / endTimeTo)
+  // Time window (best effort; supported by Finding API itemFilter)
   url.searchParams.set("itemFilter(1).name", "EndTimeFrom");
-  url.searchParams.set("itemFilter(1).value", iso(from));
+  url.searchParams.set("itemFilter(1).value", endFrom.toISOString());
+
   url.searchParams.set("itemFilter(2).name", "EndTimeTo");
-  url.searchParams.set("itemFilter(2).value", iso(now));
+  url.searchParams.set("itemFilter(2).value", endTo.toISOString());
 
-  // Sort by most recent sold
-  url.searchParams.set("sortOrder", "EndTimeSoonest");
-
-  const res = await fetch(url.toString(), {
-    headers: { "Accept": "application/json" },
-  });
+  const res = await fetch(url.toString(), { method: "GET" });
 
   if (!res.ok) {
     const txt = await res.text();
@@ -241,36 +244,42 @@ async function fetchSoldComps(params: {
 
   const json = await res.json();
 
-  const rawItems =
-    json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+  const items =
+    json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item ||
+    ([] as any[]);
 
-  const out: SoldComp[] = (rawItems as any[])
+  const out: SoldComp[] = (items as any[])
     .map((it) => {
-      const sellingStatus = it?.sellingStatus?.[0];
-      const priceObj = sellingStatus?.currentPrice?.[0];
-      const amount = Number(priceObj?.__value__);
-      const currency = String(priceObj?.["@currencyId"] || params.currency);
+      const priceValue =
+        it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ ??
+        it?.sellingStatus?.currentPrice?.__value__;
+      const amount = Number(priceValue);
+      const currency =
+        it?.sellingStatus?.[0]?.currentPrice?.[0]?.["@currencyId"] ||
+        it?.sellingStatus?.currentPrice?.["@currencyId"] ||
+        params.currency;
 
       if (!Number.isFinite(amount) || amount <= 0) return null;
 
-      const url = String(it?.viewItemURL?.[0] || "");
-      const title = String(it?.title?.[0] || "").slice(0, 180);
-      const itemId = String(it?.itemId?.[0] || "");
-      const condition = String(it?.condition?.[0]?.conditionDisplayName?.[0] || "");
-
-      const soldDate = it?.listingInfo?.[0]?.endTime?.[0]
-        ? new Date(it.listingInfo[0].endTime[0]).toISOString()
-        : undefined;
-
+      const title = String(it?.title?.[0] || it?.title || "").slice(0, 180);
+      const url = String(it?.viewItemURL?.[0] || it?.viewItemURL || "");
       if (!url) return null;
+
+      const condition = String(it?.condition?.[0]?.conditionDisplayName?.[0] || "").trim();
+      const soldDate =
+        it?.listingInfo?.[0]?.endTime?.[0] ||
+        it?.listingInfo?.endTime ||
+        undefined;
+
+      const itemId = String(it?.itemId?.[0] || it?.itemId || "");
 
       return {
         title,
         price: { amount, currency },
-        condition,
+        condition: condition || undefined,
         url,
-        itemId,
-        soldDate,
+        itemId: itemId || undefined,
+        soldDate: soldDate || undefined,
       } as SoldComp;
     })
     .filter(Boolean);
@@ -577,8 +586,8 @@ function buildBrowseFilter(body: AnalyzeRequest): string {
   const asking = Number(body.price?.amount || 0);
   if (Number.isFinite(asking) && asking > 0) {
     const isExpensive = asking >= 5000;
-    const lowMult = isExpensive ? 0.70 : 0.60;
-    const highMult = isExpensive ? 1.35 : 1.50;
+    const lowMult = isExpensive ? 0.7 : 0.6;
+    const highMult = isExpensive ? 1.35 : 1.5;
 
     const min = Math.max(1, Math.round(asking * lowMult));
     const max = Math.max(min + 1, Math.round(asking * highMult));
@@ -849,15 +858,22 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
   };
 }
 
-function confidenceFromQuality(usedForStats: Comp[]): "high" | "medium" | "low" {
+/**
+ * You renamed “confidence” => “data coverage”
+ * We keep the field name `estimate.confidence` but change its values to:
+ *  - strong / standard / limited
+ */
+type DataCoverage = "strong" | "standard" | "limited";
+
+function coverageFromQuality(usedForStats: Comp[]): DataCoverage {
   if (usedForStats.length >= 10) {
     const avg = usedForStats.reduce((s, c) => s + (c.qualityScore || 0), 0) / usedForStats.length;
-    if (avg >= 78) return "high";
-    if (avg >= 68) return "medium";
-    return "low";
+    if (avg >= 78) return "strong";
+    if (avg >= 68) return "standard";
+    return "limited";
   }
-  if (usedForStats.length >= 7) return "medium";
-  return "low";
+  if (usedForStats.length >= 7) return "standard";
+  return "limited";
 }
 
 /**
@@ -881,9 +897,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const deviceIdHeader = req.headers["x-device-id"];
     const deviceId = typeof deviceIdHeader === "string" ? deviceIdHeader : null;
-    if (!deviceId) {
-      return res.status(400).json({ error: "Missing x-device-id header" });
-    }
+    if (!deviceId) return res.status(400).json({ error: "Missing x-device-id header" });
 
     const body = req.body as AnalyzeRequest;
 
@@ -895,9 +909,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const text = `${body.title} ${body.categoryHint || ""} ${body.brand || ""}`.toLowerCase();
-    if (!looksLikeBag(text)) {
-      return res.status(400).json({ error: "Phase 1 supports bags only" });
-    }
+    if (!looksLikeBag(text)) return res.status(400).json({ error: "Phase 1 supports bags only" });
 
     // 1) Get or create user
     const { data: existingUser, error: userFetchErr } = await supabase
@@ -921,7 +933,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 2) Cache key (bump version to invalidate old cache)
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-      `comps:v101:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
+      `sold-active-v2:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
         (body as any)?.cacheBuster || ""
       }`
     );
@@ -935,7 +947,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .eq("key", cacheKey)
         .maybeSingle();
 
-      const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
+      const cacheValid =
+        cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
       if (cacheValid && cached?.value_json) {
         return res.status(200).json({ ...(cached.value_json as any), cached: true });
@@ -947,13 +960,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const marketplaceId = marketplaceIdFromUrl(body.url);
     const filter = buildBrowseFilter(body);
 
-    // 3A) Try SOLD first with expanding windows
+    // 3A) SOLD-first strategy: 90 -> 180 -> 365 ; only then fallback to ACTIVE
     const SOLD_WINDOWS = [90, 180, 365];
     const MIN_COMPS = 12;
 
     let compsAll: Comp[] = [];
     let compsSource: "sold" | "active" = "sold";
     let windowDays: number | null = null;
+
+    let bestSoldCount = 0;
+    let bestSoldWindow: number | null = null;
 
     for (const days of SOLD_WINDOWS) {
       try {
@@ -965,44 +981,58 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           daysBack: days,
         });
 
+        if (sold.length > bestSoldCount) {
+          bestSoldCount = sold.length;
+          bestSoldWindow = days;
+        }
+
         if (sold.length >= MIN_COMPS) {
           compsAll = sold;
+          compsSource = "sold";
           windowDays = days;
           break;
         }
 
+        // keep best attempt so far (even if < MIN_COMPS)
         if (sold.length > compsAll.length) {
           compsAll = sold;
+          compsSource = "sold";
           windowDays = days;
         }
-      } catch {
+      } catch (e) {
         // ignore and try next window
       }
     }
 
-    // 3B) Fallback to ACTIVE ONLY if SOLD not enough
     if (compsAll.length < MIN_COMPS) {
+      // fallback to ACTIVE
       compsSource = "active";
       windowDays = null;
 
-      compsAll = await fetchActiveComps({
+      const active = await fetchActiveComps({
         query,
         limit: 120,
         marketplaceId,
         currency: body.price.currency,
         filter,
       });
-    } else {
-      compsSource = "sold";
+
+      compsAll = active;
     }
 
-    const soldCompsCount = compsSource === "sold" ? compsAll.length : 0;
+    // how many sold comps did we actually have (even if we ended on active)?
+    const soldCompsCount = bestSoldCount;
 
     // 4) Rank + filter comps
     const { ranked, usedForStats, debug } = rankAndFilterComps(body, compsAll);
     const compsForUI = ranked.slice(0, 12);
 
-    // 5) Build payload (FIXED: no broken object / no nested res.json)
+    // meta counts (consistent)
+    const compsFound = compsAll.length;
+    const keptAfterFiltering = debug.counts.kept;
+    const compsUsed = debug.counts.used;
+
+    // 5) Build payload
     let payload: any;
 
     if (usedForStats.length >= 4) {
@@ -1026,7 +1056,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       const label = dealLabelFromRatio(ratio);
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
-      const confidence = confidenceFromQuality(usedForStats);
+      const coverage = coverageFromQuality(usedForStats);
+
+      const basisLine =
+        compsSource === "sold" && windowDays
+          ? `Based on sold listings on eBay (last ${windowDays} days).`
+          : "Based on active listings on eBay.";
 
       payload = {
         deal: {
@@ -1036,36 +1071,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            `Estimate based on top-quality eBay comps (${compsSource} listings): ${usedForStats.length} used.`,
+            basisLine,
             `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
             "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
           ],
         },
         estimate: {
+          // your UI label is “Average market value”
           resaleValue: { amount: Math.round(med), currency: body.price.currency },
           range: {
             low: { amount: Math.round(low), currency: body.price.currency },
             high: { amount: Math.round(high), currency: body.price.currency },
           },
-          confidence,
-          method: compsSource === "sold" ? "sold-comps-median-top-quality" : "active-comps-median-top-quality",
+          confidence: coverage, // strong / standard / limited
+          method:
+            compsSource === "sold"
+              ? `sold-comps-median-top-quality-${windowDays ?? "window"}`
+              : "active-comps-median-top-quality",
         },
         comps: compsForUI,
         meta: {
           backendVersion: "sold-comps-v1",
-          compsSource, // "sold" | "active"
-          windowDays, // 90/180/365 or null for active fallback
+          compsSource,
+          windowDays, // IMPORTANT: only set when SOLD is the source actually used
+          compsType: compsSource, // backward-compat for your frontend
+          soldCompsCount, // visibility: how many sold comps existed in the best attempt
           query,
           marketplaceId,
           filter,
-          compsFound: compsAll.length,
-          keptAfterFiltering: debug.counts.kept,
-          compsUsed: debug.counts.used,
-          soldCompsCount,
+          compsFound,
+          keptAfterFiltering,
+          compsUsed,
         },
       };
     } else {
-      // Limited comps: still return labels (no A/B/C)
+      // Very limited comps: return something still usable, but keep your “data coverage” tone
       const asking = body.price.amount;
       const est = asking * 0.93;
       const low = asking * 0.84;
@@ -1081,6 +1121,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const label = dealLabelFromRatio(ratio);
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
 
+      const basisLine =
+        compsSource === "sold" && windowDays
+          ? `Based on sold listings on eBay (last ${windowDays} days).`
+          : "Based on active listings on eBay.";
+
       payload = {
         deal: {
           label,
@@ -1089,8 +1134,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            `Not enough high-quality matching comps found (${compsSource} listings).`,
-            "Showing a low-confidence estimate based on available signals.",
+            basisLine,
+            "Limited matching comps for this exact query; range may be wider.",
           ],
         },
         estimate: {
@@ -1099,21 +1144,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             low: { amount: Math.round(low), currency: body.price.currency },
             high: { amount: Math.round(high), currency: body.price.currency },
           },
-          confidence: "low",
+          confidence: "limited",
           method: "limited-signals",
         },
         comps: compsForUI.length ? compsForUI : compsAll.slice(0, 12),
         meta: {
-          backendVersion: "deal-labels-v1",
+          backendVersion: "sold-comps-v1",
           compsSource,
           windowDays,
+          compsType: compsSource,
+          soldCompsCount,
           query,
           marketplaceId,
           filter,
-          compsFound: compsAll.length,
-          keptAfterFiltering: debug.counts.kept,
-          compsUsed: debug.counts.used,
-          soldCompsCount,
+          compsFound,
+          keptAfterFiltering,
+          compsUsed,
         },
       };
     }
