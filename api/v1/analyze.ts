@@ -1058,11 +1058,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
       const coverage = coverageFromQuality(usedForStats);
 
-      const basisLine =
-        compsSource === "sold" && windowDays
-          ? `Based on sold listings on eBay (last ${windowDays} days).`
-          : "Based on active listings on eBay.";
-
       payload = {
         deal: {
           label,
@@ -1071,10 +1066,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            basisLine,
-            `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
-            "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
-          ],
+  `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
+  "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
+],
+
         },
         estimate: {
           // your UI label is “Average market value”
