@@ -963,26 +963,29 @@ if (compsAll.length === 0) {
           method: "active-comps-median-top-quality",
         },
         comps: compsForUI,
-       meta: {
+     meta: {
   backendVersion: "sold-comps-v1",
 
-  // NEW — source of comps
-  compsSource,                  // "sold" | "active"
-  windowDays,                   // 90 for sold, null for active
+  // source of comps
+  compsSource,
+  windowDays,
 
-  // keep compsType for backward compatibility
+  // backward compatibility
   compsType: compsSource === "sold" ? "sold" : "active",
 
-  // existing fields (keep them)
+  // 🔎 DEBUG / VISIBILITY
+  soldCompsCount: compsSource === "sold" ? compsAll.length : 0,
+
+  // existing fields
   query,
   marketplaceId,
   filter,
 
-  // rename clarity (optional but recommended)
   compsFound: compsAll.length,
   keptAfterFiltering: debug.counts.kept,
   compsUsed: debug.counts.used,
 },
+
 
       };
     } else {
