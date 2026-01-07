@@ -459,6 +459,52 @@ function buildSearchQuery(body: AnalyzeRequest): string {
   return parts.join(" ").trim().slice(0, 300);
 }
 
+// ===========================
+// SOLD QUERY (Finding-safe)
+// ===========================
+function buildSoldQuery(body: AnalyzeRequest): string {
+  const t = normalize(body.title || "");
+  const b = normalize(body.brand || "");
+
+  // Model detection
+  const model =
+    t.includes("neverfull") ? "Neverfull" :
+    t.includes("speedy") ? "Speedy" :
+    t.includes("alma") ? "Alma" :
+    t.includes("birkin") ? "Birkin" :
+    t.includes("kelly") ? "Kelly" :
+    "";
+
+  // Size detection (LV + Hermes)
+  const size =
+    t.includes("gm") ? "GM" :
+    t.includes("mm") ? "MM" :
+    t.includes("pm") ? "PM" :
+    t.match(/\b(25|30|35|40)\b/)?.[1] || "";
+
+  const parts = [
+    body.brand || "",
+    model,
+    size,
+  ].filter(Boolean);
+
+  // Fallback if model not detected
+  if (parts.length < 2) {
+    const tokens = normalize(body.title || "")
+      .split(" ")
+      .filter(Boolean)
+      .slice(0, 4);
+
+    return [body.brand || "", ...tokens]
+      .filter(Boolean)
+      .join(" ")
+      .slice(0, 120);
+  }
+
+  return parts.join(" ").trim().slice(0, 120);
+}
+
+
 function marketplaceIdFromUrl(url: string): string {
   const u = (url || "").toLowerCase();
   if (u.includes("ebay.co.uk")) return "EBAY_GB";
