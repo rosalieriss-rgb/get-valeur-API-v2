@@ -188,8 +188,6 @@ async function fetchActiveComps(params: {
  * We use findCompletedItems + SoldItemsOnly=true and a time window.
  */
 function findingGlobalIdFromMarketplace(marketplaceId: string): string {
-  // Keep it simple; you can extend later.
-  // For your current use (ebay.com), EBAY-US is correct.
   if (marketplaceId === "EBAY_GB") return "EBAY-GB";
   if (marketplaceId === "EBAY_DE") return "EBAY-DE";
   if (marketplaceId === "EBAY_FR") return "EBAY-FR";
@@ -224,11 +222,9 @@ async function fetchSoldComps(params: {
   url.searchParams.set("keywords", keywords);
   url.searchParams.set("paginationInput.entriesPerPage", String(params.limit));
 
-  // itemFilter(s)
   url.searchParams.set("itemFilter(0).name", "SoldItemsOnly");
   url.searchParams.set("itemFilter(0).value", "true");
 
-  // Time window (best effort; supported by Finding API itemFilter)
   url.searchParams.set("itemFilter(1).name", "EndTimeFrom");
   url.searchParams.set("itemFilter(1).value", endFrom.toISOString());
 
@@ -245,8 +241,7 @@ async function fetchSoldComps(params: {
   const json = await res.json();
 
   const items =
-    json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item ||
-    ([] as any[]);
+    json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || ([] as any[]);
 
   const out: SoldComp[] = (items as any[])
     .map((it) => {
@@ -267,9 +262,7 @@ async function fetchSoldComps(params: {
 
       const condition = String(it?.condition?.[0]?.conditionDisplayName?.[0] || "").trim();
       const soldDate =
-        it?.listingInfo?.[0]?.endTime?.[0] ||
-        it?.listingInfo?.endTime ||
-        undefined;
+        it?.listingInfo?.[0]?.endTime?.[0] || it?.listingInfo?.endTime || undefined;
 
       const itemId = String(it?.itemId?.[0] || it?.itemId || "");
 
@@ -682,13 +675,7 @@ function conditionBucket(cond?: string): "new" | "used" | "unknown" {
   const c = normalize(cond || "");
   if (!c) return "unknown";
   if (c.includes("new") || c.includes("brand new") || c.includes("unused")) return "new";
-  if (
-    c.includes("pre-owned") ||
-    c.includes("used") ||
-    c.includes("very good") ||
-    c.includes("good") ||
-    c.includes("acceptable")
-  )
+  if (c.includes("pre-owned") || c.includes("used") || c.includes("very good") || c.includes("good") || c.includes("acceptable"))
     return "used";
   return "unknown";
 }
@@ -933,7 +920,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 2) Cache key (bump version to invalidate old cache)
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-      `sold-active-v2:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
+      `sold-only-market-active-resale-v3:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
         (body as any)?.cacheBuster || ""
       }`
     );
@@ -947,8 +934,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .eq("key", cacheKey)
         .maybeSingle();
 
-      const cacheValid =
-        cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
+      const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
 
       if (cacheValid && cached?.value_json) {
         return res.status(200).json({ ...(cached.value_json as any), cached: true });
@@ -960,13 +946,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const marketplaceId = marketplaceIdFromUrl(body.url);
     const filter = buildBrowseFilter(body);
 
-    // 3A) SOLD-first strategy: 90 -> 180 -> 365 ; only then fallback to ACTIVE
-    const SOLD_WINDOWS = [90, 180, 365];
-    const MIN_COMPS = 12;
+    // ---------------------------
+    // A) ACTIVE comps ALWAYS (for potential resale value)
+    // ---------------------------
+    let activeAll: Comp[] = [];
+    try {
+      activeAll = await fetchActiveComps({
+        query,
+        limit: 120,
+        marketplaceId,
+        currency: body.price.currency,
+        filter,
+      });
+    } catch (e) {
+      activeAll = [];
+    }
 
-    let compsAll: Comp[] = [];
-    let compsSource: "sold" | "active" = "sold";
-    let windowDays: number | null = null;
+    // Rank active comps for a cleaner median
+    const activeRanked = rankAndFilterComps(body, activeAll);
+    const activeUsedForStats = activeRanked.usedForStats;
+    const activePrices = activeUsedForStats
+      .map((c) => c.price.amount)
+      .filter((n) => Number.isFinite(n) && n > 0);
+    const activeMed = activePrices.length ? median(activePrices) : null;
+
+    // ---------------------------
+    // B) SOLD comps ONLY (for average market value)
+    // ---------------------------
+    const SOLD_WINDOWS = [90, 180, 365];
+    const MIN_SOLD_FOR_STRONG = 12;
+
+    let soldAll: Comp[] = [];
+    let soldWindowDays: number | null = null;
 
     let bestSoldCount = 0;
     let bestSoldWindow: number | null = null;
@@ -986,57 +997,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           bestSoldWindow = days;
         }
 
-        if (sold.length >= MIN_COMPS) {
-          compsAll = sold;
-          compsSource = "sold";
-          windowDays = days;
+        // We still keep best attempt, but if we hit MIN, we stop early
+        if (sold.length >= MIN_SOLD_FOR_STRONG) {
+          soldAll = sold;
+          soldWindowDays = days;
           break;
         }
 
-        // keep best attempt so far (even if < MIN_COMPS)
-        if (sold.length > compsAll.length) {
-          compsAll = sold;
-          compsSource = "sold";
-          windowDays = days;
+        if (sold.length > soldAll.length) {
+          soldAll = sold;
+          soldWindowDays = days;
         }
       } catch (e) {
         // ignore and try next window
       }
     }
 
-    if (compsAll.length < MIN_COMPS) {
-      // fallback to ACTIVE
-      compsSource = "active";
-      windowDays = null;
-
-      const active = await fetchActiveComps({
-        query,
-        limit: 120,
-        marketplaceId,
-        currency: body.price.currency,
-        filter,
-      });
-
-      compsAll = active;
-    }
-
-    // how many sold comps did we actually have (even if we ended on active)?
+    // Visibility: how many sold comps existed in the best attempt
     const soldCompsCount = bestSoldCount;
+    const soldBestWindow = bestSoldWindow;
 
-    // 4) Rank + filter comps
-    const { ranked, usedForStats, debug } = rankAndFilterComps(body, compsAll);
-    const compsForUI = ranked.slice(0, 12);
+    // 4) Rank + filter SOLD comps (UI + stats)
+    const soldRanked = rankAndFilterComps(body, soldAll);
+    const soldCompsForUI = soldRanked.ranked.slice(0, 12);
 
-    // meta counts (consistent)
-    const compsFound = compsAll.length;
-    const keptAfterFiltering = debug.counts.kept;
-    const compsUsed = debug.counts.used;
+    const soldCompsFound = soldAll.length;
+    const soldKeptAfterFiltering = soldRanked.debug.counts.kept;
+    const soldCompsUsed = soldRanked.debug.counts.used;
 
     // 5) Build payload
     let payload: any;
 
-    if (usedForStats.length >= 4) {
-      const prices = usedForStats
+    // We will base the deal ratio on SOLD median if possible; else use limited heuristic.
+    if (soldRanked.usedForStats.length >= 4) {
+      const prices = soldRanked.usedForStats
         .map((c) => c.price.amount)
         .filter((n) => Number.isFinite(n) && n > 0);
 
@@ -1056,7 +1050,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       const label = dealLabelFromRatio(ratio);
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
-      const coverage = coverageFromQuality(usedForStats);
+
+      const coverage = coverageFromQuality(soldRanked.usedForStats);
 
       payload = {
         deal: {
@@ -1066,39 +1061,60 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-  `Asking price vs comp median: ${(ratio * 100).toFixed(0)}%`,
-  "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
-],
-
+            `Asking price vs SOLD median: ${(ratio * 100).toFixed(0)}%`,
+            "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
+          ],
         },
-        estimate: {
-  // UI label will still be “Average market value” but now SOLD-only
-  marketValue: { amount: Math.round(med), currency: body.price.currency },
-  range: {
-    low: { amount: Math.round(low), currency: body.price.currency },
-    high: { amount: Math.round(high), currency: body.price.currency },
-  },
-  confidence: coverage, // strong / standard / limited
-  method: `sold-comps-median-top-quality-${windowDays ?? "window"}`, // SOLD only
-},
 
-        comps: compsForUI,
+        // SOLD ONLY
+        estimate: {
+          marketValue: { amount: Math.round(med), currency: body.price.currency },
+          range: {
+            low: { amount: Math.round(low), currency: body.price.currency },
+            high: { amount: Math.round(high), currency: body.price.currency },
+          },
+          confidence: coverage, // strong / standard / limited
+          method: `sold-comps-median-top-quality-${soldWindowDays ?? "window"}`,
+        },
+
+        // ACTIVE ONLY
+        resale: {
+          potentialValue:
+            activeMed != null
+              ? { amount: Math.round(activeMed), currency: body.price.currency }
+              : null,
+          count: activeAll.length,
+          method: "active-comps-median-top-quality",
+        },
+
+        // For UI: show SOLD comps list (the “details on sold comps”)
+        comps: soldCompsForUI,
+
         meta: {
-          backendVersion: "sold-comps-v1",
-          compsSource,
-          windowDays, // IMPORTANT: only set when SOLD is the source actually used
-          compsType: compsSource, // backward-compat for your frontend
-          soldCompsCount, // visibility: how many sold comps existed in the best attempt
+          backendVersion: "sold-market-active-resale-v3",
+
+          sold: {
+            daysWindow: soldWindowDays ?? soldBestWindow ?? null, // what window we ended up using / best attempt
+            compsCount: soldCompsFound,
+            soldCompsCountBestAttempt: soldCompsCount,
+          },
+          active: {
+            compsCount: activeAll.length,
+          },
+
           query,
           marketplaceId,
           filter,
-          compsFound,
-          keptAfterFiltering,
-          compsUsed,
+
+          // debug counts
+          soldCompsFound,
+          soldKeptAfterFiltering,
+          soldCompsUsed,
+          activeCompsFound: activeAll.length,
         },
       };
     } else {
-      // Very limited comps: return something still usable, but keep your “data coverage” tone
+      // Very limited SOLD comps: still return something usable (SOLD-only estimate stays heuristic)
       const asking = body.price.amount;
       const est = asking * 0.93;
       const low = asking * 0.84;
@@ -1114,11 +1130,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const label = dealLabelFromRatio(ratio);
       const { title: labelTitle, emoji: labelEmoji } = dealLabelMeta(label);
 
-      const basisLine =
-        compsSource === "sold" && windowDays
-          ? `Based on sold listings on eBay (last ${windowDays} days).`
-          : "Based on active listings on eBay.";
-
       payload = {
         deal: {
           label,
@@ -1127,32 +1138,55 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            basisLine,
-            "Limited matching comps for this exact query; range may be wider.",
+            soldWindowDays
+              ? `Sold comps found but limited (window extended to ${soldWindowDays} days).`
+              : "Very limited sold comps for this exact query; estimate uses heuristics.",
           ],
         },
+
+        // SOLD ONLY (heuristic)
         estimate: {
-          resaleValue: { amount: Math.round(est), currency: body.price.currency },
+          marketValue: { amount: Math.round(est), currency: body.price.currency },
           range: {
             low: { amount: Math.round(low), currency: body.price.currency },
             high: { amount: Math.round(high), currency: body.price.currency },
           },
           confidence: "limited",
-          method: "limited-signals",
+          method: "limited-sold-signals",
         },
-        comps: compsForUI.length ? compsForUI : compsAll.slice(0, 12),
+
+        // ACTIVE ONLY (still provided)
+        resale: {
+          potentialValue:
+            activeMed != null
+              ? { amount: Math.round(activeMed), currency: body.price.currency }
+              : null,
+          count: activeAll.length,
+          method: "active-comps-median-top-quality",
+        },
+
+        comps: soldCompsForUI.length ? soldCompsForUI : soldAll.slice(0, 12),
+
         meta: {
-          backendVersion: "sold-comps-v1",
-          compsSource,
-          windowDays,
-          compsType: compsSource,
-          soldCompsCount,
+          backendVersion: "sold-market-active-resale-v3",
+
+          sold: {
+            daysWindow: soldWindowDays ?? soldBestWindow ?? null,
+            compsCount: soldCompsFound,
+            soldCompsCountBestAttempt: soldCompsCount,
+          },
+          active: {
+            compsCount: activeAll.length,
+          },
+
           query,
           marketplaceId,
           filter,
-          compsFound,
-          keptAfterFiltering,
-          compsUsed,
+
+          soldCompsFound,
+          soldKeptAfterFiltering,
+          soldCompsUsed,
+          activeCompsFound: activeAll.length,
         },
       };
     }
