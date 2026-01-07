@@ -145,7 +145,10 @@ async function fetchActiveComps(params: {
   const url = new URL(`${EBAY_BASE}/buy/browse/v1/item_summary/search`);
   url.searchParams.set("q", q);
   url.searchParams.set("limit", String(params.limit));
-  url.searchParams.set("filter", params.filter);
+if (params.filter && String(params.filter).trim()) {
+  url.searchParams.set("filter", String(params.filter).trim());
+}
+
 
   const res = await fetch(url.toString(), {
     headers: {
