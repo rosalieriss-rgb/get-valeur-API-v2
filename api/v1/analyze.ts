@@ -145,10 +145,9 @@ async function fetchActiveComps(params: {
   const url = new URL(`${EBAY_BASE}/buy/browse/v1/item_summary/search`);
   url.searchParams.set("q", q);
   url.searchParams.set("limit", String(params.limit));
-if (params.filter && String(params.filter).trim()) {
-  url.searchParams.set("filter", String(params.filter).trim());
-}
-
+  if (params.filter && String(params.filter).trim()) {
+    url.searchParams.set("filter", String(params.filter).trim());
+  }
 
   const res = await fetch(url.toString(), {
     headers: {
@@ -288,7 +287,9 @@ async function fetchSoldComps(params: {
       return {
         title,
         price: { amount, currency },
-        condition: it?.condition?.[0]?.conditionDisplayName?.[0] || it?.condition?.[0]?.conditionDisplayName,
+        condition:
+          it?.condition?.[0]?.conditionDisplayName?.[0] ||
+          it?.condition?.[0]?.conditionDisplayName,
         url,
         itemId,
         soldDate,
@@ -453,7 +454,18 @@ function buildSearchQuery(body: AnalyzeRequest): string {
   if (bk && leather) parts.push(`"${leather}"`);
 
   // negatives to reduce junk (these are OK for ACTIVE browse; Finding will strip them)
-  const negatives = ["twilly", "strap", "dustbag", "box only", "charms", "scarf", "organizer", "insert", "accessories", "replica"];
+  const negatives = [
+    "twilly",
+    "strap",
+    "dustbag",
+    "box only",
+    "charms",
+    "scarf",
+    "organizer",
+    "insert",
+    "accessories",
+    "replica",
+  ];
   for (const n of negatives) parts.push(`-"${n}"`);
 
   return parts.join(" ").trim().slice(0, 300);
@@ -464,7 +476,7 @@ function buildSearchQuery(body: AnalyzeRequest): string {
 // ===========================
 function buildSoldQuery(body: AnalyzeRequest): string {
   const t = normalize(body.title || "");
-  const b = normalize(body.brand || "");
+  const _b = normalize(body.brand || "");
 
   // Model detection
   const model =
@@ -482,11 +494,7 @@ function buildSoldQuery(body: AnalyzeRequest): string {
     t.includes("pm") ? "PM" :
     t.match(/\b(25|30|35|40)\b/)?.[1] || "";
 
-  const parts = [
-    body.brand || "",
-    model,
-    size,
-  ].filter(Boolean);
+  const parts = [body.brand || "", model, size].filter(Boolean);
 
   // Fallback if model not detected
   if (parts.length < 2) {
@@ -495,15 +503,11 @@ function buildSoldQuery(body: AnalyzeRequest): string {
       .filter(Boolean)
       .slice(0, 4);
 
-    return [body.brand || "", ...tokens]
-      .filter(Boolean)
-      .join(" ")
-      .slice(0, 120);
+    return [body.brand || "", ...tokens].filter(Boolean).join(" ").slice(0, 120);
   }
 
   return parts.join(" ").trim().slice(0, 120);
 }
-
 
 function marketplaceIdFromUrl(url: string): string {
   const u = (url || "").toLowerCase();
@@ -797,7 +801,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 3) Build query + filters
-    const query = buildSearchQuery(body);
+    const activeQuery = buildSearchQuery(body);
+    const soldQuery = buildSoldQuery(body); // ✅ key change: SOLD should use this
     const marketplaceId = marketplaceIdFromUrl(body.url);
     const filter = buildBrowseFilter(body);
 
@@ -807,7 +812,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let activeAll: Comp[] = [];
     try {
       activeAll = await fetchActiveComps({
-        query,
+        query: activeQuery,
         limit: 120,
         marketplaceId,
         currency: body.price.currency,
@@ -830,7 +835,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const SOLD_WINDOWS = [90, 180, 365];
     const MIN_SOLD_FOR_STRONG = 12;
 
-    let soldAll: Comp[] = [];
+    let soldAll: SoldComp[] = [];
     let soldWindowDays: number | null = null;
 
     let bestSoldCount = 0;
@@ -839,7 +844,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     for (const days of SOLD_WINDOWS) {
       try {
         const sold = await fetchSoldComps({
-          query,
+          query: soldQuery, // ✅ FIX: use SOLD query helper (NOT activeQuery)
           limit: 120,
           marketplaceId,
           currency: body.price.currency,
@@ -957,7 +962,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             compsCount: activeAll.length,
           },
 
-          query,
+          // ✅ show both queries for debugging
+          activeQuery,
+          soldQuery,
+
           marketplaceId,
           filter,
 
@@ -1028,7 +1036,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             compsCount: activeAll.length,
           },
 
-          query,
+          // ✅ show both queries for debugging
+          activeQuery,
+          soldQuery,
+
           marketplaceId,
           filter,
 
