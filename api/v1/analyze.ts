@@ -1072,18 +1072,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         },
         estimate: {
-          // your UI label is “Average market value”
-          resaleValue: { amount: Math.round(med), currency: body.price.currency },
-          range: {
-            low: { amount: Math.round(low), currency: body.price.currency },
-            high: { amount: Math.round(high), currency: body.price.currency },
-          },
-          confidence: coverage, // strong / standard / limited
-          method:
-            compsSource === "sold"
-              ? `sold-comps-median-top-quality-${windowDays ?? "window"}`
-              : "active-comps-median-top-quality",
-        },
+  // UI label will still be “Average market value” but now SOLD-only
+  marketValue: { amount: Math.round(med), currency: body.price.currency },
+  range: {
+    low: { amount: Math.round(low), currency: body.price.currency },
+    high: { amount: Math.round(high), currency: body.price.currency },
+  },
+  confidence: coverage, // strong / standard / limited
+  method: `sold-comps-median-top-quality-${windowDays ?? "window"}`, // SOLD only
+},
+
         comps: compsForUI,
         meta: {
           backendVersion: "sold-comps-v1",
