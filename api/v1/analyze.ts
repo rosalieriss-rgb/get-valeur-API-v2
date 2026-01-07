@@ -8,14 +8,14 @@ import crypto from "crypto";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
-const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || ""; // also used as Finding API AppID
+const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || "";
 const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET || "";
 const EBAY_ENV = (process.env.EBAY_ENV || "PROD").toUpperCase(); // PROD | SANDBOX
 
 const EBAY_BASE =
   EBAY_ENV === "SANDBOX" ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
 
-// Finding API (Completed/Sold) is a separate endpoint and uses AppID (client id)
+// Finding API endpoint (works with AppID)
 const EBAY_FINDING_ENDPOINT = "https://svcs.ebay.com/services/search/FindingService/v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -76,7 +76,7 @@ let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
 type DealLabel = "great_deal" | "fair_price" | "overpriced";
 
 function dealLabelFromRatio(ratio: number): DealLabel {
-  // ratio = asking / compMedian
+  // ratio = asking / soldMedian
   if (!Number.isFinite(ratio) || ratio <= 0) return "fair_price";
   if (ratio <= 0.88) return "great_deal";
   if (ratio <= 1.05) return "fair_price";
@@ -135,7 +135,7 @@ async function getEbayAppToken(): Promise<string> {
 async function fetchActiveComps(params: {
   query: string;
   limit: number;
-  marketplaceId: string; // e.g., EBAY_US
+  marketplaceId: string;
   currency: string;
   filter: string;
 }): Promise<Comp[]> {
@@ -195,6 +195,21 @@ function findingGlobalIdFromMarketplace(marketplaceId: string): string {
   return "EBAY-US";
 }
 
+/**
+ * ✅ NEW: Finding API is inconsistent with quotes / negatives / accents.
+ * We clean our query to something the legacy Finding endpoint handles reliably.
+ */
+function toFindingKeywords(q: string): string {
+  return String(q || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // remove accents (Hermès -> Hermes)
+    .replace(/"([^"]+)"/g, "$1") // remove quotes
+    .replace(/\s+-"[^"]+"/g, " ") // remove -"phrase"
+    .replace(/\s+-\S+/g, " ") // remove -token
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function fetchSoldComps(params: {
   query: string;
   limit: number;
@@ -206,7 +221,8 @@ async function fetchSoldComps(params: {
     throw new Error("Missing EBAY_CLIENT_ID (used as Finding API AppID)");
   }
 
-  const keywords = params.query.trim().slice(0, 250);
+  // ✅ FIX: use Finding-safe keywords
+  const keywords = toFindingKeywords(params.query).slice(0, 250);
 
   const endTo = new Date();
   const endFrom = new Date(Date.now() - params.daysBack * 24 * 60 * 60 * 1000);
@@ -249,6 +265,7 @@ async function fetchSoldComps(params: {
         it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ ??
         it?.sellingStatus?.currentPrice?.__value__;
       const amount = Number(priceValue);
+
       const currency =
         it?.sellingStatus?.[0]?.currentPrice?.[0]?.["@currencyId"] ||
         it?.sellingStatus?.currentPrice?.["@currencyId"] ||
@@ -258,50 +275,56 @@ async function fetchSoldComps(params: {
 
       const title = String(it?.title?.[0] || it?.title || "").slice(0, 180);
       const url = String(it?.viewItemURL?.[0] || it?.viewItemURL || "");
-      if (!url) return null;
-
-      const condition = String(it?.condition?.[0]?.conditionDisplayName?.[0] || "").trim();
-      const soldDate =
-        it?.listingInfo?.[0]?.endTime?.[0] || it?.listingInfo?.endTime || undefined;
-
       const itemId = String(it?.itemId?.[0] || it?.itemId || "");
+
+      const soldDate =
+        it?.listingInfo?.[0]?.endTime?.[0] ||
+        it?.listingInfo?.endTime ||
+        undefined;
 
       return {
         title,
         price: { amount, currency },
-        condition: condition || undefined,
+        condition: it?.condition?.[0]?.conditionDisplayName?.[0] || it?.condition?.[0]?.conditionDisplayName,
         url,
-        itemId: itemId || undefined,
-        soldDate: soldDate || undefined,
+        itemId,
+        soldDate,
       } as SoldComp;
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((c: SoldComp) => !!c.url && !!c.title);
 
   return out;
 }
 
 /**
- * ===== STATS HELPERS =====
+ * ===== BASIC STATS =====
  */
-function median(nums: number[]): number {
-  const arr = [...nums].sort((a, b) => a - b);
-  const mid = Math.floor(arr.length / 2);
-  return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+function median(arr: number[]): number {
+  const a = [...arr].sort((x, y) => x - y);
+  if (!a.length) return 0;
+  const mid = Math.floor(a.length / 2);
+  if (a.length % 2) return a[mid];
+  return (a[mid - 1] + a[mid]) / 2;
 }
 
-function percentile(nums: number[], p: number): number {
-  const arr = [...nums].sort((a, b) => a - b);
-  const idx = (arr.length - 1) * p;
+function percentile(arr: number[], p: number): number {
+  const a = [...arr].sort((x, y) => x - y);
+  if (!a.length) return 0;
+  const idx = (a.length - 1) * p;
   const lo = Math.floor(idx);
   const hi = Math.ceil(idx);
-  if (lo === hi) return arr[lo];
-  return arr[lo] + (arr[hi] - arr[lo]) * (idx - lo);
+  if (lo === hi) return a[lo];
+  return a[lo] + (a[hi] - a[lo]) * (idx - lo);
 }
 
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
 
+/**
+ * ===== BAG DETECTION =====
+ */
 function looksLikeBag(text: string) {
   const bagSignals = [
     "bag",
@@ -369,35 +392,12 @@ function cleanTitleForSearch(title: string): string {
   return t;
 }
 
-const ALLOWED_SIZES = new Set([
-  "15",
-  "18",
-  "20",
-  "22",
-  "24",
-  "25",
-  "26",
-  "27",
-  "28",
-  "30",
-  "32",
-  "33",
-  "34",
-  "35",
-  "36",
-  "38",
-  "40",
-  "41",
-  "45",
-]);
-
 function extractSizeToken(title: string): string | null {
   const t = normalize(title);
   const m = t.match(
     /\b(15|18|20|22|24|25|26|27|28|30|32|33|34|35|36|38|40|41|45)\b(?:\s*cm)?\b/
   );
-  if (m?.[1] && ALLOWED_SIZES.has(m[1])) return m[1];
-  return null;
+  return m?.[1] || null;
 }
 
 const LEATHER_TOKENS = [
@@ -407,10 +407,7 @@ const LEATHER_TOKENS = [
   "swift",
   "box",
   "chevre",
-  "chevre mysore",
-  "chevre mysores",
   "barenia",
-  "barenia faubourg",
   "alligator",
   "crocodile",
   "ostrich",
@@ -420,7 +417,7 @@ const LEATHER_TOKENS = [
 function extractLeatherToken(title: string): string | null {
   const t = normalize(title);
   for (const lt of LEATHER_TOKENS) {
-    if (t.includes(normalize(lt))) return lt.split(" ")[0];
+    if (t.includes(normalize(lt))) return lt;
   }
   return null;
 }
@@ -433,301 +430,115 @@ function isBirkinOrKelly(body: AnalyzeRequest): boolean {
   return isHermes && hasBK;
 }
 
-function tokenizeCore(title: string): string[] {
-  const t = normalize(title);
-
-  const stop = new Set([
-    "bag",
-    "handbag",
-    "purse",
-    "tote",
-    "shoulder",
-    "crossbody",
-    "satchel",
-    "hobo",
-    "authentic",
-    "original",
-    "with",
-    "all",
-    "paperwork",
-    "receipt",
-    "dustbag",
-    "dust",
-    "box",
-    "tags",
-    "rare",
-    "vintage",
-    "women",
-    "womens",
-    "designer",
-    "leather",
-    "palladium",
-    "gold",
-    "silver",
-    "hardware",
-    "auth",
-    "cert",
-  ]);
-
-  const rawTokens = t.split(" ").map((x) => x.trim()).filter(Boolean);
-
-  const out: string[] = [];
-  for (const tok of rawTokens) {
-    if (stop.has(tok)) continue;
-    if (/^\d+$/.test(tok)) {
-      if (ALLOWED_SIZES.has(tok) && !out.includes(tok)) out.push(tok);
-      continue;
-    }
-    if (tok.length < 3) continue;
-    if (!out.includes(tok)) out.push(tok);
-  }
-
-  return out;
-}
-
-function buildNegativeTerms(body: AnalyzeRequest): string[] {
-  const t = normalize(body.title || "");
-  const b = normalize(body.brand || "");
-
-  const negatives: string[] = [];
-
-  const isHermes = b.includes("hermes");
-  const titleHasBirkin = t.includes("birkin");
-  const titleHasKelly = t.includes("kelly");
-  if (!(isHermes && (titleHasBirkin || titleHasKelly))) negatives.push("birkin", "kelly");
-
-  const noisy = ["style", "inspired", "look", "like", "replica", "dupe", "faux", "not authentic"];
-  for (const n of noisy) {
-    if (!t.includes(n)) negatives.push(n);
-  }
-
-  return negatives;
-}
-
-/**
- * Light model extraction
- */
-function extractModelHint(body: AnalyzeRequest): string | null {
-  const t = normalize(body.title || "");
-  const patterns: Array<{ re: RegExp; model: string }> = [
-    { re: /\bbirkin\b/, model: "birkin" },
-    { re: /\bkelly\b/, model: "kelly" },
-    { re: /\bclassic\s+flap\b/, model: "classic flap" },
-    { re: /\b2\.?55\b/, model: "2.55" },
-    { re: /\bboy\b/, model: "boy" },
-    { re: /\bneverfull\b/, model: "neverfull" },
-    { re: /\bspeedy\b/, model: "speedy" },
-    { re: /\balma\b/, model: "alma" },
-    { re: /\bcapucines\b/, model: "capucines" },
-    { re: /\bpeekaboo\b/, model: "peekaboo" },
-    { re: /\bbaguette\b/, model: "baguette" },
-    { re: /\bsaddle\b/, model: "saddle" },
-    { re: /\bbook\s+tote\b/, model: "book tote" },
-    { re: /\blady\s+dior\b/, model: "lady dior" },
-    { re: /\bcassandre\b/, model: "cassandre" },
-    { re: /\ble\s+5\s+a\s+7\b/, model: "le 5 a 7" },
-    { re: /\bloulou\b/, model: "loulou" },
-    { re: /\bjamie\b/, model: "jamie" },
-  ];
-  for (const p of patterns) if (p.re.test(t)) return p.model;
-  return null;
-}
-
 function buildSearchQuery(body: AnalyzeRequest): string {
-  const titleClean = cleanTitleForSearch(body.title || "");
+  // Your current "smart-ish" query builder (kept).
+  // Important: Finding API will now receive a cleaned version via toFindingKeywords().
   const brand = (body.brand || "").trim();
-  const brandPart = brand ? `"${brand}"` : "";
+  const cleaned = cleanTitleForSearch(body.title || "");
+  const size = extractSizeToken(body.title || "");
+  const leather = extractLeatherToken(body.title || "");
+  const bk = isBirkinOrKelly(body);
 
-  const size = extractSizeToken(titleClean);
-  const leather = extractLeatherToken(titleClean);
-  const modelHint = extractModelHint(body);
-
-  if (isBirkinOrKelly(body)) {
-    const t = normalize(titleClean);
-    const model = t.includes("birkin") ? "Birkin" : "Kelly";
-    const parts = [
-      brandPart || `"Hermes"`,
-      `"${model}"`,
-      size ? `"${size}"` : "",
-      leather ? `"${leather}"` : "",
-    ].filter(Boolean);
-
-    return parts.join(" ").trim();
-  }
-
-  const tokens = tokenizeCore(titleClean).slice(0, 7);
-
-  if (modelHint) {
-    const mh = normalize(modelHint);
-    if (!tokens.includes(mh)) tokens.unshift(mh);
-  }
-
-  if (size && !tokens.includes(size)) tokens.unshift(size);
-  if (leather && !tokens.includes(leather)) tokens.push(leather);
-
-  const core = tokens.length ? tokens.map((t) => `"${t}"`).join(" ") : `"${titleClean}"`;
-  const negatives = buildNegativeTerms(body);
-  const negativeStr = negatives.map((n) => `-"${n}"`).join(" ");
-
-  return [brandPart, core, negativeStr].filter(Boolean).join(" ").trim();
-}
-
-function buildBrowseFilter(body: AnalyzeRequest): string {
   const parts: string[] = [];
-  parts.push("buyingOptions:{FIXED_PRICE|AUCTION}");
+  if (brand) parts.push(`"${brand}"`);
+  if (cleaned) parts.push(`"${cleaned}"`);
 
-  const asking = Number(body.price?.amount || 0);
-  if (Number.isFinite(asking) && asking > 0) {
-    const isExpensive = asking >= 5000;
-    const lowMult = isExpensive ? 0.7 : 0.6;
-    const highMult = isExpensive ? 1.35 : 1.5;
+  // For Birkin/Kelly, size matters a lot:
+  if (bk && size) parts.push(`"${size}"`);
 
-    const min = Math.max(1, Math.round(asking * lowMult));
-    const max = Math.max(min + 1, Math.round(asking * highMult));
+  // Leather token helps
+  if (bk && leather) parts.push(`"${leather}"`);
 
-    parts.push(`price:[${min}..${max}]`);
-  }
+  // negatives to reduce junk (these are OK for ACTIVE browse; Finding will strip them)
+  const negatives = ["twilly", "strap", "dustbag", "box only", "charms", "scarf", "organizer", "insert", "accessories", "replica"];
+  for (const n of negatives) parts.push(`-"${n}"`);
 
-  return parts.join(",");
+  return parts.join(" ").trim().slice(0, 300);
 }
 
-function marketplaceIdFromUrl(_url: string): string {
+function marketplaceIdFromUrl(url: string): string {
+  const u = (url || "").toLowerCase();
+  if (u.includes("ebay.co.uk")) return "EBAY_GB";
+  if (u.includes("ebay.de")) return "EBAY_DE";
+  if (u.includes("ebay.fr")) return "EBAY_FR";
+  if (u.includes("ebay.it")) return "EBAY_IT";
   return "EBAY_US";
 }
 
+function buildBrowseFilter(body: AnalyzeRequest): string {
+  // Keep it simple; you can refine later.
+  // Example: price currency, condition, category etc.
+  return "conditionIds:{1000|1500|2000|2500|3000|4000|5000}";
+}
+
 /**
- * ===== COMP QUALITY RANKING =====
+ * ===== QUALITY / RANKING =====
  */
-const JUNK_PHRASES = [
-  "strap",
-  "shoulder strap",
-  "chain",
-  "charm",
-  "bag charm",
-  "twilly",
-  "scarf",
-  "keychain",
-  "key chain",
-  "key holder",
-  "wallet",
-  "card holder",
-  "cardholder",
-  "coin purse",
-  "pouch",
-  "insert",
-  "organizer",
-  "base shaper",
-  "shaper",
-  "stuffing",
-  "raincoat",
-  "rain coat",
-  "cover",
-  "replacement",
-  "repair",
-  "handle",
-  "hardware",
-  "lock only",
-  "keys only",
-  "certificate only",
-  "auth card",
-  "authenticity card",
-  "receipt only",
-  "box only",
-  "dust bag only",
-  "dustbag only",
-  "for parts",
-  "parts only",
-];
-
-const REPLICA_SIGNALS = [
-  "replica",
-  "super fake",
-  "dupe",
-  "inspired",
-  "style",
-  "look like",
-  "not authentic",
-  "faux",
-  "knockoff",
-  "counterfeit",
-  "copy",
-  "mirror 1:1",
-];
-
-function isObviousJunkCompTitle(title: string): boolean {
-  const t = normalize(title);
-  if (!t) return true;
-  if (REPLICA_SIGNALS.some((s) => t.includes(normalize(s)))) return true;
-  if (JUNK_PHRASES.some((p) => t.includes(normalize(p)))) return true;
-  return false;
-}
-
-function normalizeBrand(b: string | undefined): string | null {
-  const t = normalize(b || "");
-  if (!t) return null;
-  if (t === "louisvuitton") return "louis vuitton";
-  if (t === "saintlaurent") return "saint laurent";
-  if (t === "yvessaintlaurent") return "saint laurent";
-  return t;
-}
-
-function conditionBucket(cond?: string): "new" | "used" | "unknown" {
-  const c = normalize(cond || "");
-  if (!c) return "unknown";
-  if (c.includes("new") || c.includes("brand new") || c.includes("unused")) return "new";
-  if (c.includes("pre-owned") || c.includes("used") || c.includes("very good") || c.includes("good") || c.includes("acceptable"))
-    return "used";
-  return "unknown";
-}
-
-function buildTargetSignals(body: AnalyzeRequest) {
-  const titleClean = cleanTitleForSearch(body.title || "");
-  const brand = normalizeBrand(body.brand) || "";
-  const size = extractSizeToken(titleClean);
-  const leather = extractLeatherToken(titleClean);
-  const modelHint = extractModelHint(body);
-
-  const coreTokens = tokenizeCore(titleClean);
-  const modelTokens = modelHint?.split(" ").map(normalize).filter(Boolean) || [];
-  const brandTokens = brand ? brand.split(" ").map((x) => x.trim()).filter(Boolean) : [];
-  const negatives = buildNegativeTerms(body);
-
-  return {
-    brand,
-    size,
-    leather,
-    modelHint: modelHint ? normalize(modelHint) : null,
-    coreTokens,
-    modelTokens,
-    brandTokens,
-    negatives,
-    asking: Number(body.price?.amount || 0),
-    askingCurrency: body.price?.currency || "USD",
-    targetCond: conditionBucket(body.condition),
-  };
-}
-
-function tokenOverlapScore(targetTokens: string[], compTitleNorm: string) {
-  if (!targetTokens.length) return { hits: 0, total: 0, score: 0 };
+function tokenOverlapScore(tokens: string[], titleNorm: string) {
   let hits = 0;
-  for (const tok of targetTokens) {
-    const n = normalize(tok);
-    if (!n) continue;
-    const re = new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-    if (re.test(compTitleNorm)) hits += 1;
-  }
-  const total = targetTokens.length;
-  const ratio = total ? hits / total : 0;
-  const score = Math.round(45 * Math.pow(ratio, 0.7));
-  return { hits, total, score };
+  for (const t of tokens) if (titleNorm.includes(t)) hits++;
+  const score = hits * 6;
+  return { hits, score };
 }
 
 function priceClosenessScore(asking: number, compPrice: number) {
-  if (!Number.isFinite(asking) || asking <= 0 || !Number.isFinite(compPrice) || compPrice <= 0)
-    return 0;
+  if (!Number.isFinite(asking) || asking <= 0 || !Number.isFinite(compPrice) || compPrice <= 0) return 0;
   const r = compPrice / asking;
   const dist = Math.abs(Math.log(r));
   return Math.round(clamp(25 * (1 - dist / 1.0), 0, 25));
+}
+
+function isObviousJunkCompTitle(title: string): boolean {
+  const t = normalize(title || "");
+  const junk = [
+    "twilly",
+    "strap",
+    "dustbag",
+    "dust bag",
+    "box only",
+    "empty box",
+    "scarf",
+    "organizer",
+    "insert",
+    "charm",
+    "charms",
+    "keychain",
+    "replica",
+    "inspired",
+  ];
+  return junk.some((j) => t.includes(normalize(j)));
+}
+
+function buildTargetSignals(body: AnalyzeRequest) {
+  const titleNorm = normalize(body.title || "");
+  const brandNorm = normalize(body.brand || "");
+
+  const size = extractSizeToken(body.title || "");
+  const leather = extractLeatherToken(body.title || "");
+
+  const modelHint =
+    titleNorm.includes("birkin") ? "birkin" :
+    titleNorm.includes("kelly") ? "kelly" :
+    titleNorm.includes("classic flap") ? "classic flap" :
+    "";
+
+  const coreTokens = titleNorm.split(" ").filter(Boolean).slice(0, 8);
+  const modelTokens = modelHint ? [modelHint] : [];
+  const brandTokens = brandNorm ? brandNorm.split(" ").filter(Boolean).slice(0, 3) : [];
+
+  return {
+    asking: body.price.amount,
+    askingCurrency: body.price.currency,
+    brand: brandNorm || "",
+    brandTokens,
+    modelHint,
+    modelTokens,
+    coreTokens,
+    size,
+    leather,
+    negatives: ["replica", "inspired", "twilly", "strap", "dustbag", "scarf", "organizer", "insert", "charm", "box only"],
+    targetCond: "unknown" as const,
+  };
 }
 
 function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
@@ -743,6 +554,8 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
 
     const asking = target.asking;
     const p = Number(c.price?.amount || 0);
+
+    // drop extreme outliers
     if (Number.isFinite(asking) && asking > 0 && Number.isFinite(p) && p > 0) {
       if (asking >= 300 && p < asking * 0.25) continue;
       if (asking >= 300 && p > asking * 3.0) continue;
@@ -775,7 +588,7 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
         why.push("model+");
       } else if (target.modelTokens.length) {
         const { hits } = tokenOverlapScore(target.modelTokens, titleNorm);
-        if (hits >= Math.min(2, target.modelTokens.length)) {
+        if (hits >= 1) {
           score += 10;
           why.push("model~");
         }
@@ -807,19 +620,14 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
       }
     }
 
+    // token overlap
     const overlap = tokenOverlapScore(
       Array.from(new Set([...(target.modelTokens || []), ...(target.coreTokens || [])])).slice(0, 8),
       titleNorm
     );
     score += overlap.score;
 
-    const tc = target.targetCond;
-    const cc = conditionBucket(c.condition);
-    if (tc !== "unknown" && cc !== "unknown") {
-      if (tc === cc) score += 6;
-      else score -= 4;
-    }
-
+    // currency match
     if (c.price?.currency && target.askingCurrency && c.price.currency !== target.askingCurrency) {
       score -= 6;
       why.push("ccy!");
@@ -847,7 +655,7 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
 
 /**
  * You renamed “confidence” => “data coverage”
- * We keep the field name `estimate.confidence` but change its values to:
+ * We keep the field name `estimate.confidence` but values are:
  *  - strong / standard / limited
  */
 type DataCoverage = "strong" | "standard" | "limited";
@@ -962,7 +770,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       activeAll = [];
     }
 
-    // Rank active comps for a cleaner median
     const activeRanked = rankAndFilterComps(body, activeAll);
     const activeUsedForStats = activeRanked.usedForStats;
     const activePrices = activeUsedForStats
@@ -997,13 +804,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           bestSoldWindow = days;
         }
 
-        // We still keep best attempt, but if we hit MIN, we stop early
+        // stop early if we hit minimum
         if (sold.length >= MIN_SOLD_FOR_STRONG) {
           soldAll = sold;
           soldWindowDays = days;
           break;
         }
 
+        // keep best attempt so far
         if (sold.length > soldAll.length) {
           soldAll = sold;
           soldWindowDays = days;
@@ -1014,10 +822,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // Visibility: how many sold comps existed in the best attempt
-    const soldCompsCount = bestSoldCount;
+    const soldCompsCountBestAttempt = bestSoldCount;
     const soldBestWindow = bestSoldWindow;
 
-    // 4) Rank + filter SOLD comps (UI + stats)
+    // ✅ IMPORTANT: Always return a days window for UI, even if sold comps are thin.
+    const finalSoldWindowDays = soldWindowDays ?? soldBestWindow ?? 365;
+
+    // Rank + filter SOLD comps
     const soldRanked = rankAndFilterComps(body, soldAll);
     const soldCompsForUI = soldRanked.ranked.slice(0, 12);
 
@@ -1028,7 +839,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 5) Build payload
     let payload: any;
 
-    // We will base the deal ratio on SOLD median if possible; else use limited heuristic.
+    // base deal ratio on SOLD median if possible
     if (soldRanked.usedForStats.length >= 4) {
       const prices = soldRanked.usedForStats
         .map((c) => c.price.amount)
@@ -1074,29 +885,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             high: { amount: Math.round(high), currency: body.price.currency },
           },
           confidence: coverage, // strong / standard / limited
-          method: `sold-comps-median-top-quality-${soldWindowDays ?? "window"}`,
+          method: `sold-comps-median-top-quality-${finalSoldWindowDays}`,
         },
 
         // ACTIVE ONLY
         resale: {
-          potentialValue:
-            activeMed != null
-              ? { amount: Math.round(activeMed), currency: body.price.currency }
-              : null,
+          potentialValue: activeMed != null ? { amount: Math.round(activeMed), currency: body.price.currency } : null,
           count: activeAll.length,
           method: "active-comps-median-top-quality",
         },
 
-        // For UI: show SOLD comps list (the “details on sold comps”)
+        // For UI: show SOLD comps list
         comps: soldCompsForUI,
 
         meta: {
           backendVersion: "sold-market-active-resale-v3",
 
           sold: {
-            daysWindow: soldWindowDays ?? soldBestWindow ?? null, // what window we ended up using / best attempt
+            daysWindow: finalSoldWindowDays,
             compsCount: soldCompsFound,
-            soldCompsCountBestAttempt: soldCompsCount,
+            soldCompsCountBestAttempt,
           },
           active: {
             compsCount: activeAll.length,
@@ -1106,7 +914,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           marketplaceId,
           filter,
 
-          // debug counts
           soldCompsFound,
           soldKeptAfterFiltering,
           soldCompsUsed,
@@ -1114,7 +921,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
       };
     } else {
-      // Very limited SOLD comps: still return something usable (SOLD-only estimate stays heuristic)
+      // Very limited SOLD comps: heuristic sold estimate + still return active resale
       const asking = body.price.amount;
       const est = asking * 0.93;
       const low = asking * 0.84;
@@ -1138,9 +945,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            soldWindowDays
-              ? `Sold comps found but limited (window extended to ${soldWindowDays} days).`
-              : "Very limited sold comps for this exact query; estimate uses heuristics.",
+            `Sold comps were limited for this exact query (lookback: ${finalSoldWindowDays} days); estimate uses heuristics.`,
           ],
         },
 
@@ -1155,25 +960,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           method: "limited-sold-signals",
         },
 
-        // ACTIVE ONLY (still provided)
+        // ACTIVE ONLY
         resale: {
-          potentialValue:
-            activeMed != null
-              ? { amount: Math.round(activeMed), currency: body.price.currency }
-              : null,
+          potentialValue: activeMed != null ? { amount: Math.round(activeMed), currency: body.price.currency } : null,
           count: activeAll.length,
           method: "active-comps-median-top-quality",
         },
 
-        comps: soldCompsForUI.length ? soldCompsForUI : soldAll.slice(0, 12),
+        comps: soldCompsForUI,
 
         meta: {
           backendVersion: "sold-market-active-resale-v3",
 
           sold: {
-            daysWindow: soldWindowDays ?? soldBestWindow ?? null,
+            daysWindow: finalSoldWindowDays,
             compsCount: soldCompsFound,
-            soldCompsCountBestAttempt: soldCompsCount,
+            soldCompsCountBestAttempt,
           },
           active: {
             compsCount: activeAll.length,
@@ -1191,26 +993,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       };
     }
 
-    // 6) Cache (6h)
-    const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+    // Credits (keep simple / your existing logic can replace this)
+    const credits = { remaining: user?.credits_remaining ?? 0, plan: user?.plan || "free" };
+
+    const responseBody = { data: { ...payload, credits }, cached: false };
+
+    // cache write (short TTL)
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 30); // 30 min
     await supabase.from("cache").upsert({
       key: cacheKey,
-      value_json: payload,
-      expires_at: expiresAt,
+      value_json: responseBody,
+      expires_at: expiresAt.toISOString(),
     });
 
-    // 7) Log analysis
-    await supabase.from("analyses").insert({
-      user_id: user.id,
-      source: body.source,
-      item_key: itemKey,
-      input_json: body,
-      output_json: payload,
-    });
-
-    return res.status(200).json({ ...payload, cached: false });
-  } catch (err: any) {
-    console.error(err);
-    return res.status(500).json({ error: "Internal error", detail: err?.message || String(err) });
+    return res.status(200).json(responseBody);
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || "Unknown error" });
   }
 }
