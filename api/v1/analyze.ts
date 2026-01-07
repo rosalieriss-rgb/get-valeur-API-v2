@@ -468,10 +468,8 @@ function marketplaceIdFromUrl(url: string): string {
   return "EBAY_US";
 }
 
-function buildBrowseFilter(body: AnalyzeRequest): string {
-  // Keep it simple; you can refine later.
-  // Example: price currency, condition, category etc.
-  return "conditionIds:{1000|1500|2000|2500|3000|4000|5000}";
+function buildBrowseFilter(_body: AnalyzeRequest): string {
+  return "";
 }
 
 /**
