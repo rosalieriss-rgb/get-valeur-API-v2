@@ -847,11 +847,14 @@ let bestSoldWindow: number | null = null;
 // Debug diagnostics for SOLD fetch
 const soldDiagnostics: any[] = [];
 
+let soldAll: any[] = [];
+let soldWindowDays: number | null = null;
+
 for (const days of SOLD_WINDOWS) {
   try {
     const sold = await fetchSoldComps({
-      query: soldQuery, // ✅ use SOLD query helper (NOT activeQuery)
-      limit: 100,       // ✅ Finding API max entriesPerPage is 100
+      query: soldQuery,
+      limit: 100,
       marketplaceId,
       currency: body.price.currency,
       daysBack: days,
@@ -863,11 +866,6 @@ for (const days of SOLD_WINDOWS) {
       fetched: sold.length,
     });
 
-    if (sold.length > bestSoldCount) {
-      bestSoldCount = sold.length;
-      bestSoldWindow = days;
-    }
-
     // stop early if we hit minimum
     if (sold.length >= MIN_SOLD_FOR_STRONG) {
       soldAll = sold;
@@ -875,48 +873,33 @@ for (const days of SOLD_WINDOWS) {
       break;
     }
 
-try {
-  // --- your existing call that returns sold comps for this window ---
-  // Example:
-  // const sold = await fetchSoldCompsForWindow(...);
-  // ---------------------------------------------------------------
-  // (IMPORTANT: sold must be defined inside this try)
+    // keep best attempt so far
+    if (sold.length > soldAll.length) {
+      soldAll = sold;
+      soldWindowDays = days;
+    }
+  } catch (e: any) {
+    const msg = e?.message || String(e);
 
-  // stop early if we hit minimum
-  if (sold.length >= MIN_SOLD_FOR_STRONG) {
-    soldAll = sold;
-    soldWindowDays = days;
-    break;
-  }
+    soldDiagnostics.push({
+      daysBack: days,
+      query: soldQuery,
+      error: msg,
+    });
 
-  // keep best attempt so far
-  if (sold.length > soldAll.length) {
-    soldAll = sold;
-    soldWindowDays = days;
-  }
-} catch (e: any) {
-  const msg = e?.message || String(e);
-
-  soldDiagnostics.push({
-    daysBack: days,
-    query: soldQuery,
-    error: msg,
-  });
-
-  // stop trying other windows if we're rate-limited
-  if (
-    msg.includes("RateLimiter") ||
-    msg.includes("exceeded the number of times")
-  ) {
-    break;
+    // 🚫 stop trying other windows if we're rate-limited
+    if (
+      msg.includes("RateLimiter") ||
+      msg.includes("exceeded the number of times")
+    ) {
+      break;
+    }
   }
 }
 
-
-
-    // Visibility: how many sold comps existed in the best attempt
-    const soldCompsCountBestAttempt = bestSoldCount;
-    const soldBestWindow = bestSoldWindow;
+// Visibility: how many sold comps existed in the best attempt
+const soldCompsCountBestAttempt = soldAll.length;
+const soldBestWindow = soldWindowDays;
 
     // ✅ IMPORTANT: Always return a days window for UI, even if sold comps are thin.
     const finalSoldWindowDays = soldWindowDays ?? soldBestWindow ?? 365;
