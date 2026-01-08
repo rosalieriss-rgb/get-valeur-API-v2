@@ -903,9 +903,15 @@ if (!soldCooldownActive) {
     });
 
     // 🚫 stop trying other windows if we're rate-limited
-    if (msg.includes("RateLimiter") || msg.includes("exceeded the number of times")) {
-      break;
-    }
+if (msg.includes("RateLimiter") || msg.includes("exceeded the number of times")) {
+  const cdExpiresAt = new Date(Date.now() + 1000 * 60 * 60); // 1 hour
+  await supabase.from("cache").upsert({
+    key: soldCooldownKey,
+    value_json: { reason: "rate-limited" },
+    expires_at: cdExpiresAt.toISOString(),
+  });
+  break;
+}
   }
 }
 
