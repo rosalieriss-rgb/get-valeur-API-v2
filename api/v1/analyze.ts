@@ -832,7 +832,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
  // ---------------------------
 // B) SOLD comps ONLY (for average market value)
 // ---------------------------
-const SOLD_WINDOWS = [90, 365] as const;   // ✅ keep 90 when possible
+const SOLD_WINDOWS = [365] as const;   // ✅ keep 90 when possible
 const MIN_SOLD_FOR_STRONG = 12;
 
 // Debug diagnostics for SOLD fetch
