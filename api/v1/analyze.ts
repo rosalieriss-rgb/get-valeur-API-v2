@@ -880,13 +880,23 @@ for (const days of SOLD_WINDOWS) {
       soldAll = sold;
       soldWindowDays = days;
     }
-  } catch (e: any) {
-    soldDiagnostics.push({
-      daysBack: days,
-      query: soldQuery,
-      error: e?.message || String(e),
-    });
+} catch (e: any) {
+  const msg = e?.message || String(e);
+
+  soldDiagnostics.push({
+    daysBack: days,
+    query: soldQuery,
+    error: msg,
+  });
+
+  // 🚫 Stop trying other windows if we're rate-limited
+  if (
+    msg.includes("RateLimiter") ||
+    msg.includes("exceeded the number of times")
+  ) {
+    break;
   }
+}
 }
 
     // Visibility: how many sold comps existed in the best attempt
