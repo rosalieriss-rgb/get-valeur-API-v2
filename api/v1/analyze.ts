@@ -1054,6 +1054,8 @@ for (const days of SOLD_WINDOWS) {
             compsCount: activeAll.length,
           },
 
+          soldDiagnostics,
+
           // ✅ show both queries for debugging
           activeQuery,
           soldQuery,
