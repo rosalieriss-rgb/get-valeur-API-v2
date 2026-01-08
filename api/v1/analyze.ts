@@ -875,11 +875,25 @@ for (const days of SOLD_WINDOWS) {
       break;
     }
 
-    // keep best attempt so far
-    if (sold.length > soldAll.length) {
-      soldAll = sold;
-      soldWindowDays = days;
-    }
+try {
+  // --- your existing call that returns sold comps for this window ---
+  // Example:
+  // const sold = await fetchSoldCompsForWindow(...);
+  // ---------------------------------------------------------------
+  // (IMPORTANT: sold must be defined inside this try)
+
+  // stop early if we hit minimum
+  if (sold.length >= MIN_SOLD_FOR_STRONG) {
+    soldAll = sold;
+    soldWindowDays = days;
+    break;
+  }
+
+  // keep best attempt so far
+  if (sold.length > soldAll.length) {
+    soldAll = sold;
+    soldWindowDays = days;
+  }
 } catch (e: any) {
   const msg = e?.message || String(e);
 
@@ -889,7 +903,7 @@ for (const days of SOLD_WINDOWS) {
     error: msg,
   });
 
-  // 🚫 Stop trying other windows if we're rate-limited
+  // stop trying other windows if we're rate-limited
   if (
     msg.includes("RateLimiter") ||
     msg.includes("exceeded the number of times")
@@ -897,7 +911,8 @@ for (const days of SOLD_WINDOWS) {
     break;
   }
 }
-}
+
+
 
     // Visibility: how many sold comps existed in the best attempt
     const soldCompsCountBestAttempt = bestSoldCount;
