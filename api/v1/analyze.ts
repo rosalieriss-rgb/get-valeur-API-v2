@@ -1076,7 +1076,7 @@ const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length -
     const responseBody = { data: { ...payload, credits }, cached: false };
 
    // cache write (short TTL)
-const expiresAt = new Date(Date.now() + 1000 * 60 * 30); // 30 min
+const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 6); // 6 hours
 await supabase.from("cache").upsert({
   key: cacheKey,
   value_json: responseBody,
