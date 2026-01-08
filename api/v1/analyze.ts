@@ -28,7 +28,7 @@ function normalize(s: string): string {
   return (s || "")
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // remove accents
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^\w\s-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -46,8 +46,6 @@ type AnalyzeRequest = {
   condition?: string;
   brand?: string;
   categoryHint?: string;
-
-  // optional (sent from content.js)
   cacheBuster?: string;
   debugPriceRaw?: string;
 };
@@ -58,14 +56,12 @@ type Comp = {
   condition?: string;
   url: string;
   itemId?: string;
-
-  // Debug / ranking
   qualityScore?: number;
   qualityWhy?: string[];
 };
 
 type SoldComp = Comp & {
-  soldDate?: string; // ISO date string (best effort)
+  soldDate?: string;
 };
 
 let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
@@ -76,7 +72,6 @@ let tokenCache: { accessToken: string; expiresAtMs: number } | null = null;
 type DealLabel = "great_deal" | "fair_price" | "overpriced";
 
 function dealLabelFromRatio(ratio: number): DealLabel {
-  // ratio = asking / soldMedian
   if (!Number.isFinite(ratio) || ratio <= 0) return "fair_price";
   if (ratio <= 0.88) return "great_deal";
   if (ratio <= 1.05) return "fair_price";
@@ -107,7 +102,7 @@ async function getEbayAppToken(): Promise<string> {
 
   const basic = Buffer.from(`${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`).toString("base64");
 
-  const res = await fetch(`${EBAY_BASE}/identity/v1/oauth2/token`, {
+  const r = await fetch(`${EBAY_BASE}/identity/v1/oauth2/token`, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
@@ -119,12 +114,12 @@ async function getEbayAppToken(): Promise<string> {
     }).toString(),
   });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`eBay token error (${res.status}): ${txt}`);
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`eBay token error (${r.status}): ${txt}`);
   }
 
-  const json = (await res.json()) as { access_token: string; expires_in: number };
+  const json = (await r.json()) as { access_token: string; expires_in: number };
   tokenCache = { accessToken: json.access_token, expiresAtMs: now + json.expires_in * 1000 };
   return tokenCache.accessToken;
 }
@@ -149,22 +144,22 @@ async function fetchActiveComps(params: {
     url.searchParams.set("filter", String(params.filter).trim());
   }
 
-  const res = await fetch(url.toString(), {
+  const r = await fetch(url.toString(), {
     headers: {
       Authorization: `Bearer ${token}`,
       "X-EBAY-C-MARKETPLACE-ID": params.marketplaceId,
     },
   });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Browse search error (${res.status}): ${txt}`);
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`Browse search error (${r.status}): ${txt}`);
   }
 
-  const json = await res.json();
+  const json = await r.json();
   const items = (json?.itemSummaries || []) as any[];
 
-  const comps: Comp[] = items
+  return items
     .map((it) => {
       const amount = Number(it?.price?.value);
       const currency = it?.price?.currency || params.currency;
@@ -180,14 +175,10 @@ async function fetchActiveComps(params: {
     })
     .filter(Boolean)
     .filter((c: Comp) => !!c.url);
-
-  return comps;
 }
 
 /**
  * ===== EBAY FINDING API (SOLD comps) =====
- * Uses AppID (= EBAY_CLIENT_ID). Works without OAuth.
- * We use findCompletedItems + SoldItemsOnly=true and a time window.
  */
 function findingGlobalIdFromMarketplace(marketplaceId: string): string {
   if (marketplaceId === "EBAY_GB") return "EBAY-GB";
@@ -197,17 +188,13 @@ function findingGlobalIdFromMarketplace(marketplaceId: string): string {
   return "EBAY-US";
 }
 
-/**
- * ✅ NEW: Finding API is inconsistent with quotes / negatives / accents.
- * We clean our query to something the legacy Finding endpoint handles reliably.
- */
 function toFindingKeywords(q: string): string {
   return String(q || "")
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // remove accents (Hermès -> Hermes)
-    .replace(/"([^"]+)"/g, "$1") // remove quotes
-    .replace(/\s+-"[^"]+"/g, " ") // remove -"phrase"
-    .replace(/\s+-\S+/g, " ") // remove -token
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/"([^"]+)"/g, "$1")
+    .replace(/\s+-"[^"]+"/g, " ")
+    .replace(/\s+-\S+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -219,11 +206,8 @@ async function fetchSoldComps(params: {
   currency: string;
   daysBack: number;
 }): Promise<SoldComp[]> {
-  if (!EBAY_CLIENT_ID) {
-    throw new Error("Missing EBAY_CLIENT_ID (used as Finding API AppID)");
-  }
+  if (!EBAY_CLIENT_ID) throw new Error("Missing EBAY_CLIENT_ID (Finding AppID)");
 
-  // ✅ FIX: use Finding-safe keywords
   const keywords = toFindingKeywords(params.query).slice(0, 250);
 
   const endTo = new Date();
@@ -249,19 +233,18 @@ async function fetchSoldComps(params: {
   url.searchParams.set("itemFilter(2).name", "EndTimeTo");
   url.searchParams.set("itemFilter(2).value", endTo.toISOString());
 
-  const res = await fetch(url.toString(), { method: "GET" });
+  const r = await fetch(url.toString(), { method: "GET" });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Finding (sold) error (${res.status}): ${txt}`);
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`Finding (sold) error (${r.status}): ${txt}`);
   }
 
-  const json = await res.json();
-
+  const json = await r.json();
   const items =
     json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || ([] as any[]);
 
-  const out: SoldComp[] = (items as any[])
+  return (items as any[])
     .map((it) => {
       const priceValue =
         it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ ??
@@ -280,9 +263,7 @@ async function fetchSoldComps(params: {
       const itemId = String(it?.itemId?.[0] || it?.itemId || "");
 
       const soldDate =
-        it?.listingInfo?.[0]?.endTime?.[0] ||
-        it?.listingInfo?.endTime ||
-        undefined;
+        it?.listingInfo?.[0]?.endTime?.[0] || it?.listingInfo?.endTime || undefined;
 
       return {
         title,
@@ -297,8 +278,6 @@ async function fetchSoldComps(params: {
     })
     .filter(Boolean)
     .filter((c: SoldComp) => !!c.url && !!c.title);
-
-  return out;
 }
 
 /**
@@ -308,8 +287,7 @@ function median(arr: number[]): number {
   const a = [...arr].sort((x, y) => x - y);
   if (!a.length) return 0;
   const mid = Math.floor(a.length / 2);
-  if (a.length % 2) return a[mid];
-  return (a[mid - 1] + a[mid]) / 2;
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
 }
 
 function percentile(arr: number[], p: number): number {
@@ -361,10 +339,7 @@ function looksLikeBag(text: string) {
  * ===== QUERY CLEANING =====
  */
 function cleanTitleForSearch(title: string): string {
-  let t = (title || "")
-    .replace(/[^\w\s-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  let t = (title || "").replace(/[^\w\s-]/g, " ").replace(/\s+/g, " ").trim();
 
   const stopPhrases = [
     "original",
@@ -391,9 +366,7 @@ function cleanTitleForSearch(title: string): string {
     const re = new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
     t = t.replace(re, " ");
   }
-
-  t = t.replace(/\s+/g, " ").trim();
-  return t;
+  return t.replace(/\s+/g, " ").trim();
 }
 
 function extractSizeToken(title: string): string | null {
@@ -420,23 +393,17 @@ const LEATHER_TOKENS = [
 
 function extractLeatherToken(title: string): string | null {
   const t = normalize(title);
-  for (const lt of LEATHER_TOKENS) {
-    if (t.includes(normalize(lt))) return lt;
-  }
+  for (const lt of LEATHER_TOKENS) if (t.includes(normalize(lt))) return lt;
   return null;
 }
 
 function isBirkinOrKelly(body: AnalyzeRequest): boolean {
   const t = normalize(body.title || "");
   const b = normalize(body.brand || "");
-  const isHermes = b.includes("hermes");
-  const hasBK = t.includes("birkin") || t.includes("kelly");
-  return isHermes && hasBK;
+  return b.includes("hermes") && (t.includes("birkin") || t.includes("kelly"));
 }
 
 function buildSearchQuery(body: AnalyzeRequest): string {
-  // Your current "smart-ish" query builder (kept).
-  // Important: Finding API will now receive a cleaned version via toFindingKeywords().
   const brand = (body.brand || "").trim();
   const cleaned = cleanTitleForSearch(body.title || "");
   const size = extractSizeToken(body.title || "");
@@ -446,14 +413,9 @@ function buildSearchQuery(body: AnalyzeRequest): string {
   const parts: string[] = [];
   if (brand) parts.push(`"${brand}"`);
   if (cleaned) parts.push(`"${cleaned}"`);
-
-  // For Birkin/Kelly, size matters a lot:
   if (bk && size) parts.push(`"${size}"`);
-
-  // Leather token helps
   if (bk && leather) parts.push(`"${leather}"`);
 
-  // negatives to reduce junk (these are OK for ACTIVE browse; Finding will strip them)
   const negatives = [
     "twilly",
     "strap",
@@ -476,9 +438,7 @@ function buildSearchQuery(body: AnalyzeRequest): string {
 // ===========================
 function buildSoldQuery(body: AnalyzeRequest): string {
   const t = normalize(body.title || "");
-  const _b = normalize(body.brand || "");
 
-  // Model detection
   const model =
     t.includes("neverfull") ? "Neverfull" :
     t.includes("speedy") ? "Speedy" :
@@ -487,7 +447,6 @@ function buildSoldQuery(body: AnalyzeRequest): string {
     t.includes("kelly") ? "Kelly" :
     "";
 
-  // Size detection (LV + Hermes)
   const size =
     t.includes("gm") ? "GM" :
     t.includes("mm") ? "MM" :
@@ -496,13 +455,8 @@ function buildSoldQuery(body: AnalyzeRequest): string {
 
   const parts = [body.brand || "", model, size].filter(Boolean);
 
-  // Fallback if model not detected
   if (parts.length < 2) {
-    const tokens = normalize(body.title || "")
-      .split(" ")
-      .filter(Boolean)
-      .slice(0, 4);
-
+    const tokens = normalize(body.title || "").split(" ").filter(Boolean).slice(0, 4);
     return [body.brand || "", ...tokens].filter(Boolean).join(" ").slice(0, 120);
   }
 
@@ -528,8 +482,7 @@ function buildBrowseFilter(_body: AnalyzeRequest): string {
 function tokenOverlapScore(tokens: string[], titleNorm: string) {
   let hits = 0;
   for (const t of tokens) if (titleNorm.includes(t)) hits++;
-  const score = hits * 6;
-  return { hits, score };
+  return { hits, score: hits * 6 };
 }
 
 function priceClosenessScore(asking: number, compPrice: number) {
@@ -587,8 +540,18 @@ function buildTargetSignals(body: AnalyzeRequest) {
     coreTokens,
     size,
     leather,
-    negatives: ["replica", "inspired", "twilly", "strap", "dustbag", "scarf", "organizer", "insert", "charm", "box only"],
-    targetCond: "unknown" as const,
+    negatives: [
+      "replica",
+      "inspired",
+      "twilly",
+      "strap",
+      "dustbag",
+      "scarf",
+      "organizer",
+      "insert",
+      "charm",
+      "box only",
+    ],
   };
 }
 
@@ -606,7 +569,6 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
     const asking = target.asking;
     const p = Number(c.price?.amount || 0);
 
-    // drop extreme outliers
     if (Number.isFinite(asking) && asking > 0 && Number.isFinite(p) && p > 0) {
       if (asking >= 300 && p < asking * 0.25) continue;
       if (asking >= 300 && p > asking * 3.0) continue;
@@ -671,14 +633,12 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
       }
     }
 
-    // token overlap
     const overlap = tokenOverlapScore(
       Array.from(new Set([...(target.modelTokens || []), ...(target.coreTokens || [])])).slice(0, 8),
       titleNorm
     );
     score += overlap.score;
 
-    // currency match
     if (c.price?.currency && target.askingCurrency && c.price.currency !== target.askingCurrency) {
       score -= 6;
       why.push("ccy!");
@@ -705,9 +665,7 @@ function rankAndFilterComps(body: AnalyzeRequest, compsIn: Comp[]) {
 }
 
 /**
- * You renamed “confidence” => “data coverage”
- * We keep the field name `estimate.confidence` but values are:
- *  - strong / standard / limited
+ * Confidence => data coverage
  */
 type DataCoverage = "strong" | "standard" | "limited";
 
@@ -776,11 +734,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       user = newUser;
     }
 
-    // 2) Cache key (bump version to invalidate old cache)
+    // 2) Cache key
     const itemKey = body.itemId || body.url;
     const cacheKey = sha256(
-      `sold-only-market-active-resale-v3:${body.source}:${itemKey}:${body.title}:${body.price?.amount}:${body.price?.currency}:${
-        (body as any)?.cacheBuster || ""
+      `sold-only-market-active-resale-v3:${body.source}:${itemKey}:${body.title}:${body.price.amount}:${body.price.currency}:${
+        body.cacheBuster || ""
       }`
     );
 
@@ -794,15 +752,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .maybeSingle();
 
       const cacheValid = cached?.expires_at && new Date(cached.expires_at).getTime() > now.getTime();
-
       if (cacheValid && cached?.value_json) {
         return res.status(200).json({ ...(cached.value_json as any), cached: true });
       }
     }
 
-    // 3) Build query + filters
-   const activeQuery = buildSoldQuery(body); // simple: "Hermès Birkin 30"
-    const soldQuery = buildSoldQuery(body); // ✅ key change: SOLD should use this
+    // 3) Build query + filters  ✅ FIX: activeQuery must be buildSearchQuery, not buildSoldQuery
+    const activeQuery = buildSearchQuery(body);
+    const soldQuery = buildSoldQuery(body);
     const marketplaceId = marketplaceIdFromUrl(body.url);
     const filter = buildBrowseFilter(body);
 
@@ -818,110 +775,82 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         currency: body.price.currency,
         filter,
       });
-    } catch (e) {
+    } catch {
       activeAll = [];
     }
 
     const activeRanked = rankAndFilterComps(body, activeAll);
     const activeUsedForStats = activeRanked.usedForStats;
-    const activePrices = activeUsedForStats
-      .map((c) => c.price.amount)
-      .filter((n) => Number.isFinite(n) && n > 0);
+    const activePrices = activeUsedForStats.map((c) => c.price.amount).filter((n) => Number.isFinite(n) && n > 0);
     const activeMed = activePrices.length ? median(activePrices) : null;
 
- // ---------------------------
-// B) SOLD comps ONLY (for average market value)
-// ---------------------------
-const SOLD_WINDOWS = [365] as const;   // ✅ keep 90 when possible
-const MIN_SOLD_FOR_STRONG = 12;
+    // ---------------------------
+    // B) SOLD comps ONLY (for average market value)
+    // ---------------------------
+    const SOLD_WINDOWS = [365] as const;
+    const MIN_SOLD_FOR_STRONG = 12;
 
-// Debug diagnostics for SOLD fetch
-const soldDiagnostics: any[] = [];
+    const soldDiagnostics: any[] = [];
+    let soldAll: SoldComp[] = [];
+    let soldWindowDays: number | null = null;
 
-let soldAll: SoldComp[] = [];
-let soldWindowDays: number | null = null;
+    // ⏸️ SOLD rate-limit cooldown
+    const soldCooldownKey = `soldCooldown:${marketplaceId}:${sha256(soldQuery)}`;
 
-// ⏸️ SOLD rate-limit cooldown (prevents Finding API 500s)
-const soldCooldownKey = `soldCooldown:${marketplaceId}:${sha256(soldQuery)}`;
+    const { data: soldCd } = await supabase
+      .from("cache")
+      .select("expires_at")
+      .eq("key", soldCooldownKey)
+      .maybeSingle();
 
-const { data: soldCd } = await supabase
-  .from("cache")
-  .select("expires_at")
-  .eq("key", soldCooldownKey)
-  .maybeSingle();
+    const soldCooldownActive =
+      !!soldCd?.expires_at && new Date(soldCd.expires_at).getTime() > Date.now();
 
-const soldCooldownActive =
-  !!soldCd?.expires_at && new Date(soldCd.expires_at).getTime() > Date.now();
+    if (soldCooldownActive) {
+      soldDiagnostics.push({ note: "Skipping SOLD fetch (cooldown active)" });
+    } else {
+      for (const days of SOLD_WINDOWS) {
+        try {
+          const sold = await fetchSoldComps({
+            query: soldQuery,
+            limit: 100,
+            marketplaceId,
+            currency: body.price.currency,
+            daysBack: days,
+          });
 
-if (soldCooldownActive) {
-  soldDiagnostics.push({ note: "Skipping SOLD fetch (cooldown active)" });
-}
-    
-if (!soldCooldownActive) {
-  for (const days of SOLD_WINDOWS) {
-    try {
-      const sold = await fetchSoldComps({
-        query: soldQuery,
-        limit: 100,
-        marketplaceId,
-        currency: body.price.currency,
-        daysBack: days,
-      });
+          soldDiagnostics.push({ daysBack: days, query: soldQuery, fetched: sold.length });
 
-      query: soldQuery,
-      limit: 100,
-      marketplaceId,
-      currency: body.price.currency,
-      daysBack: days,
-    });
+          if (sold.length >= MIN_SOLD_FOR_STRONG) {
+            soldAll = sold;
+            soldWindowDays = days;
+            break;
+          }
 
-    soldDiagnostics.push({
-      daysBack: days,
-      query: soldQuery,
-      fetched: sold.length,
-    });
+          if (sold.length > soldAll.length) {
+            soldAll = sold;
+            soldWindowDays = days;
+          }
+        } catch (e: any) {
+          const msg = e?.message || String(e);
+          soldDiagnostics.push({ daysBack: days, query: soldQuery, error: msg });
 
-    // stop early if we hit minimum
-    if (sold.length >= MIN_SOLD_FOR_STRONG) {
-      soldAll = sold;
-      soldWindowDays = days;
-      break;
+          if (msg.includes("RateLimiter") || msg.includes("exceeded the number of times")) {
+            const cdExpiresAt = new Date(Date.now() + 1000 * 60 * 60); // 1 hour
+            await supabase.from("cache").upsert({
+              key: soldCooldownKey,
+              value_json: { reason: "rate-limited" },
+              expires_at: cdExpiresAt.toISOString(),
+            });
+            break;
+          }
+        }
+      }
     }
 
-    // keep best attempt so far
-    if (sold.length > soldAll.length) {
-      soldAll = sold;
-      soldWindowDays = days;
-    }
-  } catch (e: any) {
-    const msg = e?.message || String(e);
+    const soldCompsCountBestAttempt = soldAll.length;
+    const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length - 1];
 
-    soldDiagnostics.push({
-      daysBack: days,
-      query: soldQuery,
-      error: msg,
-    });
-
-    // 🚫 stop trying other windows if we're rate-limited
-if (msg.includes("RateLimiter") || msg.includes("exceeded the number of times")) {
-  const cdExpiresAt = new Date(Date.now() + 1000 * 60 * 60); // 1 hour
-  await supabase.from("cache").upsert({
-    key: soldCooldownKey,
-    value_json: { reason: "rate-limited" },
-    expires_at: cdExpiresAt.toISOString(),
-  });
-  break;
-}
-  }
-}
-
-// Visibility: how many sold comps existed in the best attempt
-const soldCompsCountBestAttempt = soldAll.length;
-
-// Always return a days window for UI
-const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length - 1];
-
-    // Rank + filter SOLD comps
     const soldRanked = rankAndFilterComps(body, soldAll);
     const soldCompsForUI = soldRanked.ranked.slice(0, 12);
 
@@ -932,11 +861,8 @@ const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length -
     // 5) Build payload
     let payload: any;
 
-    // base deal ratio on SOLD median if possible
     if (soldRanked.usedForStats.length >= 4) {
-      const prices = soldRanked.usedForStats
-        .map((c) => c.price.amount)
-        .filter((n) => Number.isFinite(n) && n > 0);
+      const prices = soldRanked.usedForStats.map((c) => c.price.amount).filter((n) => Number.isFinite(n) && n > 0);
 
       const med = median(prices);
       const low = percentile(prices, 0.25);
@@ -969,49 +895,35 @@ const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length -
             "Quality ranking filters accessories/replicas and prioritizes close model/size matches.",
           ],
         },
-
-        // SOLD ONLY
         estimate: {
           marketValue: { amount: Math.round(med), currency: body.price.currency },
           range: {
             low: { amount: Math.round(low), currency: body.price.currency },
             high: { amount: Math.round(high), currency: body.price.currency },
           },
-          confidence: coverage, // strong / standard / limited
+          confidence: coverage,
           method: `sold-comps-median-top-quality-${finalSoldWindowDays}`,
         },
-
-        // ACTIVE ONLY
         resale: {
           potentialValue: activeMed != null ? { amount: Math.round(activeMed), currency: body.price.currency } : null,
           count: activeAll.length,
           method: "active-comps-median-top-quality",
         },
-
-        // For UI: show SOLD comps list
         comps: soldCompsForUI,
-
         meta: {
           backendVersion: "sold-market-active-resale-v3",
-
           sold: {
             daysWindow: finalSoldWindowDays,
             compsCount: soldCompsFound,
             soldCompsCountBestAttempt,
+            cooldownActive: soldCooldownActive,
           },
-          active: {
-            compsCount: activeAll.length,
-          },
-
+          active: { compsCount: activeAll.length },
           soldDiagnostics,
-
-          // ✅ show both queries for debugging
           activeQuery,
           soldQuery,
-
           marketplaceId,
           filter,
-
           soldCompsFound,
           soldKeptAfterFiltering,
           soldCompsUsed,
@@ -1019,7 +931,6 @@ const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length -
         },
       };
     } else {
-      // Very limited SOLD comps: heuristic sold estimate + still return active resale
       const asking = body.price.amount;
       const est = asking * 0.93;
       const low = asking * 0.84;
@@ -1043,11 +954,9 @@ const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length -
           score,
           ratio: Number(ratio.toFixed(3)),
           explanationBullets: [
-            `Sold comps were limited for this exact query (lookback: ${finalSoldWindowDays} days); estimate uses heuristics.`,
+            `Sold comps were limited (lookback: ${finalSoldWindowDays} days); estimate uses heuristics.`,
           ],
         },
-
-        // SOLD ONLY (heuristic)
         estimate: {
           marketValue: { amount: Math.round(est), currency: body.price.currency },
           range: {
@@ -1057,37 +966,26 @@ const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length -
           confidence: "limited",
           method: "limited-sold-signals",
         },
-
-        // ACTIVE ONLY
         resale: {
           potentialValue: activeMed != null ? { amount: Math.round(activeMed), currency: body.price.currency } : null,
           count: activeAll.length,
           method: "active-comps-median-top-quality",
         },
-
         comps: soldCompsForUI,
-
         meta: {
           backendVersion: "sold-market-active-resale-v3",
-
           sold: {
             daysWindow: finalSoldWindowDays,
             compsCount: soldCompsFound,
             soldCompsCountBestAttempt,
+            cooldownActive: soldCooldownActive,
           },
-          active: {
-            compsCount: activeAll.length,
-          },
-
+          active: { compsCount: activeAll.length },
           soldDiagnostics,
-
-          // ✅ show both queries for debugging
           activeQuery,
           soldQuery,
-
           marketplaceId,
           filter,
-
           soldCompsFound,
           soldKeptAfterFiltering,
           soldCompsUsed,
@@ -1096,27 +994,23 @@ const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length -
       };
     }
 
-    // Credits (keep simple / your existing logic can replace this)
     const credits = { remaining: user?.credits_remaining ?? 0, plan: user?.plan || "free" };
-
     const responseBody = { data: { ...payload, credits }, cached: false };
 
-   // cache write (short TTL)
-const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24 hours
-await supabase.from("cache").upsert({
-  key: cacheKey,
-  value_json: responseBody,
-  expires_at: expiresAt.toISOString(),
-});
+    // cache write
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24h
+    await supabase.from("cache").upsert({
+      key: cacheKey,
+      value_json: responseBody,
+      expires_at: expiresAt.toISOString(),
+    });
 
-return res.status(200).json(responseBody);
-
-} catch (err: any) {
-  console.error("API crash:", err);
-
-  return res.status(500).json({
-    error: "Server error",
-    message: err?.message || String(err),
-  });
-}
+    return res.status(200).json(responseBody);
+  } catch (err: any) {
+    console.error("API crash:", err);
+    return res.status(500).json({
+      error: "Server error",
+      message: err?.message || String(err),
+    });
+  }
 }
