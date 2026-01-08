@@ -829,22 +829,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .filter((n) => Number.isFinite(n) && n > 0);
     const activeMed = activePrices.length ? median(activePrices) : null;
 
-    // ---------------------------
-    // B) SOLD comps ONLY (for average market value)
-    // ---------------------------
-  // ---------------------------
+ // ---------------------------
 // B) SOLD comps ONLY (for average market value)
 // ---------------------------
-const SOLD_WINDOWS = [365] as const;
+const SOLD_WINDOWS = [90, 365] as const;   // ✅ keep 90 when possible
 const MIN_SOLD_FOR_STRONG = 12;
-
-let soldAll: SoldComp[] = [];
-let soldWindowDays: number | null = null;
 
 // Debug diagnostics for SOLD fetch
 const soldDiagnostics: any[] = [];
 
-let soldAll: any[] = [];
+let soldAll: SoldComp[] = [];
 let soldWindowDays: number | null = null;
 
 for (const days of SOLD_WINDOWS) {
@@ -885,10 +879,7 @@ for (const days of SOLD_WINDOWS) {
     });
 
     // 🚫 stop trying other windows if we're rate-limited
-    if (
-      msg.includes("RateLimiter") ||
-      msg.includes("exceeded the number of times")
-    ) {
+    if (msg.includes("RateLimiter") || msg.includes("exceeded the number of times")) {
       break;
     }
   }
@@ -896,7 +887,10 @@ for (const days of SOLD_WINDOWS) {
 
 // Visibility: how many sold comps existed in the best attempt
 const soldCompsCountBestAttempt = soldAll.length;
-const soldBestWindow = soldWindowDays;
+
+// Always return a days window for UI
+const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length - 1];
+
 
     // ✅ IMPORTANT: Always return a days window for UI, even if sold comps are thin.
     const finalSoldWindowDays = soldWindowDays ?? soldBestWindow ?? 365;
