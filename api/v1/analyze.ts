@@ -891,10 +891,6 @@ const soldCompsCountBestAttempt = soldAll.length;
 // Always return a days window for UI
 const finalSoldWindowDays = soldWindowDays ?? SOLD_WINDOWS[SOLD_WINDOWS.length - 1];
 
-
-    // ✅ IMPORTANT: Always return a days window for UI, even if sold comps are thin.
-    const finalSoldWindowDays = soldWindowDays ?? soldBestWindow ?? 365;
-
     // Rank + filter SOLD comps
     const soldRanked = rankAndFilterComps(body, soldAll);
     const soldCompsForUI = soldRanked.ranked.slice(0, 12);
