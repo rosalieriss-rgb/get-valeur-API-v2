@@ -1,3 +1,7 @@
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  try {
+    // ⬇️ EVERYTHING you already have stays here
+
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
@@ -1094,3 +1098,14 @@ const soldBestWindow = soldWindowDays;
     return res.status(500).json({ error: e?.message || "Unknown error" });
   }
 }
+
+      } catch (err: any) {
+    console.error("API crash:", err);
+
+    return res.status(500).json({
+      error: "Server error",
+      message: err?.message || String(err),
+    });
+  }
+}
+
