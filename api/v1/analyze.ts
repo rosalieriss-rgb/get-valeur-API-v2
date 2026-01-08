@@ -1085,27 +1085,22 @@ const soldBestWindow = soldWindowDays;
 
     const responseBody = { data: { ...payload, credits }, cached: false };
 
-    // cache write (short TTL)
-    const expiresAt = new Date(Date.now() + 1000 * 60 * 30); // 30 min
-    await supabase.from("cache").upsert({
-      key: cacheKey,
-      value_json: responseBody,
-      expires_at: expiresAt.toISOString(),
-    });
+   // cache write (short TTL)
+const expiresAt = new Date(Date.now() + 1000 * 60 * 30); // 30 min
+await supabase.from("cache").upsert({
+  key: cacheKey,
+  value_json: responseBody,
+  expires_at: expiresAt.toISOString(),
+});
 
-    return res.status(200).json(responseBody);
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "Unknown error" });
-  }
-}
+return res.status(200).json(responseBody);
 
-      } catch (err: any) {
-    console.error("API crash:", err);
+} catch (err: any) {
+  console.error("API crash:", err);
 
-    return res.status(500).json({
-      error: "Server error",
-      message: err?.message || String(err),
-    });
-  }
+  return res.status(500).json({
+    error: "Server error",
+    message: err?.message || String(err),
+  });
 }
 
