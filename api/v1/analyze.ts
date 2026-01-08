@@ -841,9 +841,33 @@ const soldDiagnostics: any[] = [];
 let soldAll: SoldComp[] = [];
 let soldWindowDays: number | null = null;
 
-for (const days of SOLD_WINDOWS) {
-  try {
-    const sold = await fetchSoldComps({
+// ⏸️ SOLD rate-limit cooldown (prevents Finding API 500s)
+const soldCooldownKey = `soldCooldown:${marketplaceId}:${sha256(soldQuery)}`;
+
+const { data: soldCd } = await supabase
+  .from("cache")
+  .select("expires_at")
+  .eq("key", soldCooldownKey)
+  .maybeSingle();
+
+const soldCooldownActive =
+  !!soldCd?.expires_at && new Date(soldCd.expires_at).getTime() > Date.now();
+
+if (soldCooldownActive) {
+  soldDiagnostics.push({ note: "Skipping SOLD fetch (cooldown active)" });
+}
+    
+if (!soldCooldownActive) {
+  for (const days of SOLD_WINDOWS) {
+    try {
+      const sold = await fetchSoldComps({
+        query: soldQuery,
+        limit: 100,
+        marketplaceId,
+        currency: body.price.currency,
+        daysBack: days,
+      });
+
       query: soldQuery,
       limit: 100,
       marketplaceId,
