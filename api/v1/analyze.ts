@@ -1,7 +1,3 @@
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  try {
-    // ⬇️ EVERYTHING you already have stays here
-
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
