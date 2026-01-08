@@ -801,7 +801,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 3) Build query + filters
-    const activeQuery = buildSearchQuery(body);
+   const activeQuery = buildSoldQuery(body); // simple: "Hermès Birkin 30"
     const soldQuery = buildSoldQuery(body); // ✅ key change: SOLD should use this
     const marketplaceId = marketplaceIdFromUrl(body.url);
     const filter = buildBrowseFilter(body);
