@@ -813,7 +813,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       activeAll = await fetchActiveComps({
         query: activeQuery,
-        limit: 120,
+        limit: 100,
         marketplaceId,
         currency: body.price.currency,
         filter,
@@ -832,46 +832,62 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // ---------------------------
     // B) SOLD comps ONLY (for average market value)
     // ---------------------------
-    const SOLD_WINDOWS = [90, 180, 365];
-    const MIN_SOLD_FOR_STRONG = 12;
+  // ---------------------------
+// B) SOLD comps ONLY (for average market value)
+// ---------------------------
+const SOLD_WINDOWS = [90, 180, 365] as const;
+const MIN_SOLD_FOR_STRONG = 12;
 
-    let soldAll: SoldComp[] = [];
-    let soldWindowDays: number | null = null;
+let soldAll: SoldComp[] = [];
+let soldWindowDays: number | null = null;
 
-    let bestSoldCount = 0;
-    let bestSoldWindow: number | null = null;
+let bestSoldCount = 0;
+let bestSoldWindow: number | null = null;
 
-    for (const days of SOLD_WINDOWS) {
-      try {
-        const sold = await fetchSoldComps({
-          query: soldQuery, // ✅ FIX: use SOLD query helper (NOT activeQuery)
-          limit: 120,
-          marketplaceId,
-          currency: body.price.currency,
-          daysBack: days,
-        });
+// Debug diagnostics for SOLD fetch
+const soldDiagnostics: any[] = [];
 
-        if (sold.length > bestSoldCount) {
-          bestSoldCount = sold.length;
-          bestSoldWindow = days;
-        }
+for (const days of SOLD_WINDOWS) {
+  try {
+    const sold = await fetchSoldComps({
+      query: soldQuery, // ✅ use SOLD query helper (NOT activeQuery)
+      limit: 100,       // ✅ Finding API max entriesPerPage is 100
+      marketplaceId,
+      currency: body.price.currency,
+      daysBack: days,
+    });
 
-        // stop early if we hit minimum
-        if (sold.length >= MIN_SOLD_FOR_STRONG) {
-          soldAll = sold;
-          soldWindowDays = days;
-          break;
-        }
+    soldDiagnostics.push({
+      daysBack: days,
+      query: soldQuery,
+      fetched: sold.length,
+    });
 
-        // keep best attempt so far
-        if (sold.length > soldAll.length) {
-          soldAll = sold;
-          soldWindowDays = days;
-        }
-      } catch (e) {
-        // ignore and try next window
-      }
+    if (sold.length > bestSoldCount) {
+      bestSoldCount = sold.length;
+      bestSoldWindow = days;
     }
+
+    // stop early if we hit minimum
+    if (sold.length >= MIN_SOLD_FOR_STRONG) {
+      soldAll = sold;
+      soldWindowDays = days;
+      break;
+    }
+
+    // keep best attempt so far
+    if (sold.length > soldAll.length) {
+      soldAll = sold;
+      soldWindowDays = days;
+    }
+  } catch (e: any) {
+    soldDiagnostics.push({
+      daysBack: days,
+      query: soldQuery,
+      error: e?.message || String(e),
+    });
+  }
+}
 
     // Visibility: how many sold comps existed in the best attempt
     const soldCompsCountBestAttempt = bestSoldCount;
