@@ -841,9 +841,6 @@ const MIN_SOLD_FOR_STRONG = 12;
 let soldAll: SoldComp[] = [];
 let soldWindowDays: number | null = null;
 
-let bestSoldCount = 0;
-let bestSoldWindow: number | null = null;
-
 // Debug diagnostics for SOLD fetch
 const soldDiagnostics: any[] = [];
 
