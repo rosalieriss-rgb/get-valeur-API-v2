@@ -835,7 +835,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ---------------------------
 // B) SOLD comps ONLY (for average market value)
 // ---------------------------
-const SOLD_WINDOWS = [90, 180, 365] as const;
+const SOLD_WINDOWS = [365] as const;
 const MIN_SOLD_FOR_STRONG = 12;
 
 let soldAll: SoldComp[] = [];
